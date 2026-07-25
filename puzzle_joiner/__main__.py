@@ -3,10 +3,12 @@ import sys
 from PySide6.QtWidgets import QApplication
 from PySide6.QtCore import QTimer
 
+from .cache import cleanup_old_cache_entries
 from .main_window import MainWindow
 
 
 def main():
+    cleanup_old_cache_entries()
     app = QApplication(sys.argv)
     app.setApplicationName("Puzzle Joiner")
     app.setApplicationVersion("1.0")

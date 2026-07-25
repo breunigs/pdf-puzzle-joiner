@@ -1,6 +1,8 @@
 import os
 import hashlib
 import json
+import shutil
+import time
 
 import cv2
 
@@ -8,6 +10,20 @@ from .preprocessing import compute_auto_crop_rect
 
 
 CACHE_BASE = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")), "puzzle-joiner")
+_CACHE_MAX_AGE_SECONDS = 30 * 24 * 3600  # 1 month
+
+
+def cleanup_old_cache_entries():
+    """Remove cache entries (subdirectories of CACHE_BASE) older than 1 month."""
+    if not os.path.isdir(CACHE_BASE):
+        return
+    now = time.time()
+    for entry in os.listdir(CACHE_BASE):
+        entry_path = os.path.join(CACHE_BASE, entry)
+        if not os.path.isdir(entry_path):
+            continue
+        if now - os.path.getmtime(entry_path) > _CACHE_MAX_AGE_SECONDS:
+            shutil.rmtree(entry_path, ignore_errors=True)
 
 
 def _pdf_cache_key(pdf_path: str) -> str:
