@@ -564,9 +564,10 @@ class MainWindow(QMainWindow):
         item = self.scene.piece_items.get(piece)
         if item:
             item.setSelected(True)
-            # Center view on piece
             bb = piece.get_bounding_box()
-            self.view.centerOn(bb.center().x(), bb.center().y())
+            viewport_rect = self.view.mapToScene(self.view.viewport().rect()).boundingRect()
+            if not viewport_rect.intersects(bb):
+                self.view.smoothCenterOn(bb.center().x(), bb.center().y())
         self.thumbnail_panel.select_piece(piece)
         self._update_snap_enabled()
 

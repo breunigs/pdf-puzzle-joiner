@@ -18,7 +18,8 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import (
     Qt, QRectF, QPointF, QSizeF, QObject, Signal,
-    QRunnable, QThreadPool, QEvent,
+    QRunnable, QThreadPool, QEvent, QEasingCurve,
+    QVariantAnimation,
 )
 from PySide6.QtGui import (
     QPixmap, QImage, QPainter, QPen, QColor, QBrush, QCursor,
@@ -438,6 +439,33 @@ class PuzzleView(QGraphicsView):
         self._drag_start_rot = 0.0
         self._drag_start_scale = 1.0
         self._drag_piece_item = None
+        self._scroll_anim = None
+
+    def smoothCenterOn(self, x, y, duration_ms=500):
+        """Animate scrolling to center on (x, y) in scene coordinates."""
+        if self._scroll_anim:
+            self._scroll_anim.stop()
+        target = self.mapFromScene(QPointF(x, y))
+        viewport_center = QPointF(self.viewport().width() / 2.0,
+                                  self.viewport().height() / 2.0)
+        dx = target.x() - viewport_center.x()
+        dy = target.y() - viewport_center.y()
+        start_h = self.horizontalScrollBar().value()
+        start_v = self.verticalScrollBar().value()
+        anim = QVariantAnimation(self)
+        anim.setStartValue(0.0)
+        anim.setEndValue(1.0)
+        anim.setDuration(duration_ms)
+        anim.setEasingCurve(QEasingCurve.Type.InOutCubic)
+
+        def _step(value):
+            self.horizontalScrollBar().setValue(int(start_h + dx * value))
+            self.verticalScrollBar().setValue(int(start_v + dy * value))
+
+        anim.valueChanged.connect(_step)
+        anim.finished.connect(lambda: setattr(self, '_scroll_anim', None))
+        self._scroll_anim = anim
+        anim.start()
 
     def _get_selected_item(self):
         scene = self.scene()
