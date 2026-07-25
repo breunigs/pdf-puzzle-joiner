@@ -12,7 +12,7 @@ from PySide6.QtWidgets import (
     QFileDialog, QDialog, QMessageBox, QProgressDialog,
 )
 from PySide6.QtCore import Qt, QTimer, QThreadPool
-from PySide6.QtGui import QAction
+from PySide6.QtGui import QAction, QUndoStack, QKeySequence
 
 from .model import PuzzlePiece
 from .preprocessing import (
@@ -31,6 +31,7 @@ from .widgets import (
     PuzzleScene, PuzzleView, ThumbnailPanel,
     PdfImportDialog, CutToolDialog,
 )
+from .undo import TransformCommand, SnapCommand, SnapAllCommand, LockCommand
 
 
 class MainWindow(QMainWindow):
@@ -41,6 +42,7 @@ class MainWindow(QMainWindow):
         self.pieces: list = []
         self._work_dir = None
         self._thread_pool = QThreadPool.globalInstance()
+        self.undo_stack = QUndoStack(self)
 
         self._build_ui()
 
@@ -56,43 +58,61 @@ class MainWindow(QMainWindow):
         toolbar = QToolBar("Main Toolbar")
         self.addToolBar(toolbar)
 
-        self.action_open_pdf = QAction("Open PDF", self)
+        self.action_open_pdf = QAction("Open PDF (Ctrl+O)", self)
+        self.action_open_pdf.setShortcut(QKeySequence("Ctrl+O"))
         self.action_open_pdf.triggered.connect(self.on_open_pdf)
         toolbar.addAction(self.action_open_pdf)
 
-        self.action_open_images = QAction("Open Images", self)
+        self.action_open_images = QAction("Open Images (Ctrl+I)", self)
+        self.action_open_images.setShortcut(QKeySequence("Ctrl+I"))
         self.action_open_images.triggered.connect(self.on_open_images)
         toolbar.addAction(self.action_open_images)
 
         toolbar.addSeparator()
 
-        self.action_auto_detect = QAction("Auto-Detect", self)
+        self.action_undo = self.undo_stack.createUndoAction(self, "Undo (Ctrl+Z)")
+        self.action_undo.setShortcut(QKeySequence.StandardKey.Undo)
+        toolbar.addAction(self.action_undo)
+
+        self.action_redo = self.undo_stack.createRedoAction(self, "Redo (Ctrl+Y)")
+        self.action_redo.setShortcut(QKeySequence.StandardKey.Redo)
+        toolbar.addAction(self.action_redo)
+
+        toolbar.addSeparator()
+
+        self.action_auto_detect = QAction("Auto-Detect (Ctrl+D)", self)
+        self.action_auto_detect.setShortcut(QKeySequence("Ctrl+D"))
         self.action_auto_detect.triggered.connect(self.on_auto_detect)
         toolbar.addAction(self.action_auto_detect)
 
-        self.action_snap = QAction("Snap", self)
+        self.action_snap = QAction("Snap (Ctrl+S)", self)
+        self.action_snap.setShortcut(QKeySequence("Ctrl+S"))
         self.action_snap.triggered.connect(self.on_snap)
         toolbar.addAction(self.action_snap)
 
         toolbar.addSeparator()
 
-        self.action_cut = QAction("Cut", self)
+        self.action_cut = QAction("Crop (Ctrl+X)", self)
+        self.action_cut.setShortcut(QKeySequence("Ctrl+X"))
         self.action_cut.triggered.connect(self.on_cut)
         toolbar.addAction(self.action_cut)
 
-        self.action_lock = QAction("Lock/Unlock", self)
+        self.action_lock = QAction("Lock/Unlock (Ctrl+L)", self)
+        self.action_lock.setShortcut(QKeySequence("Ctrl+L"))
         self.action_lock.triggered.connect(self.on_lock_toggle)
         toolbar.addAction(self.action_lock)
 
         toolbar.addSeparator()
 
-        self.action_export = QAction("Export TIFF", self)
+        self.action_export = QAction("Export TIFF (Ctrl+E)", self)
+        self.action_export.setShortcut(QKeySequence("Ctrl+E"))
         self.action_export.triggered.connect(self.on_export)
         toolbar.addAction(self.action_export)
 
         toolbar.addSeparator()
 
-        self.action_fit = QAction("Fit View", self)
+        self.action_fit = QAction("Fit View (Ctrl+F)", self)
+        self.action_fit.setShortcut(QKeySequence("Ctrl+F"))
         self.action_fit.triggered.connect(self.on_fit_view)
         toolbar.addAction(self.action_fit)
 
@@ -102,7 +122,7 @@ class MainWindow(QMainWindow):
         main_layout.addWidget(self.thumbnail_panel)
 
         # Canvas
-        self.scene = PuzzleScene()
+        self.scene = PuzzleScene(undo_stack=self.undo_stack)
         self.scene.selection_changed_signal.connect(self.on_scene_selection_changed)
         self.scene.piece_moved_signal.connect(self._update_snap_enabled)
         self.view = PuzzleView(self.scene)
@@ -325,13 +345,17 @@ class MainWindow(QMainWindow):
     def on_snap(self):
         piece = self.scene.get_selected_piece()
         if piece is None:
-            # Snap all unmatched
             self._snap_all()
             return
         neighbors = self.scene.get_neighbors(piece)
         if not neighbors:
             self.status_bar.showMessage("No neighbors found for snapping.")
             return
+
+        # Capture before state
+        old_x, old_y = piece.x, piece.y
+        old_rot, old_scale = piece.rotation_deg, piece.scale
+        old_matched = piece.is_matched
 
         def task(progress):
             progress.emit(20, "Computing features...")
@@ -340,12 +364,14 @@ class MainWindow(QMainWindow):
             return ok
 
         def on_done(ok):
-            item = self.scene.piece_items.get(piece)
-            if item:
-                item.sync_from_piece()
             if ok:
-                piece.is_matched = True
-                self.thumbnail_panel.update_piece(piece)
+                cmd = SnapCommand(
+                    piece, old_x, old_y, old_rot, old_scale, old_matched,
+                    piece.x, piece.y, piece.rotation_deg, piece.scale, True,
+                    sync_fn=self._sync_piece,
+                )
+                # Already applied by snap_piece_to_neighbors, so push without re-doing
+                self.undo_stack.push(cmd)
                 self.status_bar.showMessage("Snap successful.")
             else:
                 self.status_bar.showMessage("Snap found no match.")
@@ -354,8 +380,13 @@ class MainWindow(QMainWindow):
         self._run_with_progress("Snapping piece", task, on_done=on_done)
 
     def _snap_all(self):
+        # Capture before states for all pieces
+        before = {p: (p.x, p.y, p.rotation_deg, p.scale, p.is_matched)
+                  for p in self.pieces}
+
         def task(progress):
             total = len(self.pieces)
+            snapped = []
             for i, piece in enumerate(self.pieces):
                 progress.emit(int(90 * i / max(total, 1)), f"Snapping piece {i+1}/{total}...")
                 neighbors = self.scene.get_neighbors(piece)
@@ -363,9 +394,21 @@ class MainWindow(QMainWindow):
                     ok = snap_piece_to_neighbors(piece, neighbors)
                     if ok:
                         piece.is_matched = True
-            return True
+                        snapped.append(piece)
+            return snapped
 
-        def on_done(result):
+        def on_done(snapped):
+            if snapped:
+                cmds = []
+                for p in snapped:
+                    ox, oy, orot, oscale, omatched = before[p]
+                    cmds.append(SnapCommand(
+                        p, ox, oy, orot, oscale, omatched,
+                        p.x, p.y, p.rotation_deg, p.scale, True,
+                        sync_fn=self._sync_piece,
+                    ))
+                cmd = SnapAllCommand(cmds)
+                self.undo_stack.push(cmd)
             self.scene.sync_all_from_pieces()
             self.thumbnail_panel.update_all()
             self._update_snap_enabled()
@@ -396,15 +439,20 @@ class MainWindow(QMainWindow):
         if piece is None:
             self.status_bar.showMessage("Select a piece first.")
             return
-        piece.is_locked = not piece.is_locked
+        cmd = LockCommand(piece, sync_fn=self._sync_piece)
+        self.undo_stack.push(cmd)
+        state = "locked" if piece.is_locked else "unlocked"
+        self.status_bar.showMessage(f"Piece {state}.")
+
+    def _sync_piece(self, piece):
+        """Sync piece visuals after undo/redo."""
         item = self.scene.piece_items.get(piece)
         if item:
             item.sync_from_piece()
             if piece.is_locked:
                 item.setSelected(False)
         self.thumbnail_panel.update_piece(piece)
-        state = "locked" if piece.is_locked else "unlocked"
-        self.status_bar.showMessage(f"Piece {state}.")
+        self._update_snap_enabled()
 
     # --- Export ---
 

@@ -24,6 +24,7 @@ puzzle_joiner/
   cache.py                 # Page cache (~/.cache/puzzle-joiner/{md5}/)
   matching.py              # ORB features, pairwise matching, auto-detect, snap
   export.py                # Layered + flattened TIFF export
+  undo.py                  # QUndoCommand subclasses (TransformCommand, SnapCommand, LockCommand)
   worker.py                # WorkerSignals, Worker (QRunnable pattern)
   widgets.py               # All Qt widgets (handles, piece items, scene, view, thumbnails, dialogs)
   main_window.py           # MainWindow (toolbar, import flow, action handlers)
@@ -33,6 +34,7 @@ tests/
   test_model.py            # PuzzlePiece math (crop, affine, bounding box)
   test_cache.py            # cache path generation
   test_priority.py         # LOW_PRIO prefix
+  test_undo.py             # undo/redo commands (transform, snap, lock)
   test_boot.py             # smoke test: MainWindow constructs (offscreen Qt)
 ```
 

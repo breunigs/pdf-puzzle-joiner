@@ -113,6 +113,18 @@ class HandleItem(QGraphicsRectItem):
         if event.button() == Qt.MouseButton.LeftButton:
             self._dragging = False
             event.accept()
+            piece_item = self.parentItem()
+            piece = piece_item.piece
+            changed = (piece.x != self._drag_start_piece_x or
+                       piece.y != self._drag_start_piece_y or
+                       piece.rotation_deg != self._drag_start_rot or
+                       piece.scale != self._drag_start_scale)
+            if changed:
+                desc = "Rotate" if self.handle_type == self.ROTATE else "Scale"
+                piece_item._push_transform_command(
+                    self._drag_start_piece_x, self._drag_start_piece_y,
+                    self._drag_start_rot, self._drag_start_scale, desc,
+                )
             scene = self.scene()
             if scene and hasattr(scene, 'piece_moved_signal'):
                 scene.piece_moved_signal.emit()
@@ -247,6 +259,8 @@ class PuzzlePieceItem(QGraphicsPixmapItem):
         if self.piece.is_locked:
             event.ignore()
             return
+        self._drag_start_x = self.piece.x
+        self._drag_start_y = self.piece.y
         super().mousePressEvent(event)
 
     def mouseReleaseEvent(self, event):
@@ -255,8 +269,36 @@ class PuzzlePieceItem(QGraphicsPixmapItem):
             return
         super().mouseReleaseEvent(event)
         self.sync_to_piece()
+        if hasattr(self, '_drag_start_x'):
+            p = self.piece
+            if p.x != self._drag_start_x or p.y != self._drag_start_y:
+                self._push_transform_command(
+                    self._drag_start_x, self._drag_start_y,
+                    p.rotation_deg, p.scale, "Move",
+                )
         if self.scene_ref and hasattr(self.scene_ref, 'piece_moved_signal'):
             self.scene_ref.piece_moved_signal.emit()
+
+    def _push_transform_command(self, old_x, old_y, old_rot, old_scale, desc):
+        if not self.scene_ref or not hasattr(self.scene_ref, 'undo_stack'):
+            return
+        undo_stack = self.scene_ref.undo_stack
+        if undo_stack is None:
+            return
+        from .undo import TransformCommand
+        p = self.piece
+        cmd = TransformCommand(
+            p, old_x, old_y, old_rot, old_scale,
+            p.x, p.y, p.rotation_deg, p.scale,
+            sync_fn=self._undo_sync, description=desc,
+        )
+        undo_stack.push(cmd)
+
+    def _undo_sync(self, piece):
+        """Called by undo/redo to sync visuals."""
+        item = self.scene_ref.piece_items.get(piece) if self.scene_ref else None
+        if item:
+            item.sync_from_piece()
 
     def paint(self, painter, option, widget=None):
         if self.isSelected():
@@ -283,9 +325,10 @@ class PuzzleScene(QGraphicsScene):
     selection_changed_signal = Signal(object)  # piece or None
     piece_moved_signal = Signal()  # emitted after any piece drag
 
-    def __init__(self):
+    def __init__(self, undo_stack=None):
         super().__init__()
         self.piece_items: dict = {}  # PuzzlePiece -> PuzzlePieceItem
+        self.undo_stack = undo_stack
         self.setSceneRect(-50000, -50000, 100000, 100000)
 
     def add_piece(self, piece: PuzzlePiece) -> PuzzlePieceItem:
