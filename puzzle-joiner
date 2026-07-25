@@ -45,6 +45,34 @@ from PySide6.QtGui import (
 
 
 # ---------------------------------------------------------------------------
+# Low-priority execution
+# ---------------------------------------------------------------------------
+
+import shutil
+
+def _build_low_prio_prefix():
+    """Build command prefix for low-priority execution (idle scheduling, nice, ionice)."""
+    prefix = []
+    if shutil.which("chrt"):
+        prefix += ["chrt", "--idle", "0"]
+    if shutil.which("nice"):
+        prefix += ["nice", "-n19"]
+    if shutil.which("ionice"):
+        prefix += ["ionice", "--class", "idle"]
+    return prefix
+
+LOW_PRIO = _build_low_prio_prefix()
+
+
+def _set_low_priority():
+    """Set low priority for the current process (used as ProcessPoolExecutor initializer)."""
+    try:
+        os.nice(19)
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------------------
 # Data model
 # ---------------------------------------------------------------------------
 
@@ -148,7 +176,7 @@ def parse_page_range(text: str) -> list:
 def split_pdf_pages(pdf_path: str, work_dir: str, pages=None) -> list:
     """Split PDF into per-page PDFs. Returns list of (page_num_1indexed, pdf_path) tuples."""
     subprocess.run(
-        ["pdfseparate", pdf_path, os.path.join(work_dir, "page_%04d.pdf")],
+        [*LOW_PRIO, "pdfseparate", pdf_path, os.path.join(work_dir, "page_%04d.pdf")],
         check=True,
     )
     pdf_pages = sorted(glob.glob(os.path.join(work_dir, "page_*.pdf")))
@@ -171,7 +199,7 @@ def _convert_and_process_page(args):
     png_path = pdf_page_path.replace(".pdf", ".png")
     subprocess.run(
         [
-            "convert", "-density", "300", "-background", "white",
+            *LOW_PRIO, "convert", "-density", "300", "-background", "white",
             pdf_page_path, "-background", "white", "-alpha", "remove",
             "-trim", "-depth", "8", "-quality", "00", png_path,
         ],
@@ -198,7 +226,7 @@ def pdf_page_info(pdf_path: str) -> tuple:
     try:
         # First pass: get page count
         result = subprocess.run(
-            ["pdfinfo", pdf_path], capture_output=True, text=True, check=True
+            [*LOW_PRIO, "pdfinfo", pdf_path], capture_output=True, text=True, check=True
         )
         for line in result.stdout.splitlines():
             if line.startswith("Pages:"):
@@ -207,7 +235,7 @@ def pdf_page_info(pdf_path: str) -> tuple:
         if page_count > 0:
             # Second pass: get per-page sizes
             result = subprocess.run(
-                ["pdfinfo", "-f", "1", "-l", str(page_count), pdf_path],
+                [*LOW_PRIO, "pdfinfo", "-f", "1", "-l", str(page_count), pdf_path],
                 capture_output=True, text=True, check=True,
             )
             import re
@@ -1812,7 +1840,7 @@ class ThumbnailWorker(QRunnable):
             # pdftocairo supports writing to stdout with -singlefile and -
             result = subprocess.run(
                 [
-                    "pdftocairo", "-png", "-singlefile",
+                    *LOW_PRIO, "pdftocairo", "-png", "-singlefile",
                     "-f", str(self.page_num),
                     "-l", str(self.page_num),
                     "-scale-to", "200",
@@ -1826,7 +1854,7 @@ class ThumbnailWorker(QRunnable):
                 page_idx = self.page_num - 1
                 result = subprocess.run(
                     [
-                        "convert", "-density", "72",
+                        *LOW_PRIO, "convert", "-density", "72",
                         f"{self.pdf_path}[{page_idx}]",
                         "-resize", "200x200",
                         "png:-",
@@ -2400,7 +2428,7 @@ class MainWindow(QMainWindow):
                 load_args = [(pn, cached_pages[pn], requested.index(pn))
                              for pn in requested if pn in cached_pages]
                 workers = max(1, os.cpu_count() // 2)
-                with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as executor:
+                with concurrent.futures.ProcessPoolExecutor(max_workers=workers, initializer=_set_low_priority) as executor:
                     for i, res in enumerate(executor.map(_load_cached_page, load_args)):
                         if res is not None:
                             results.append(res)
@@ -2422,7 +2450,7 @@ class MainWindow(QMainWindow):
                     convert_args.append((pdf_page_path, pdf_page_num, idx, cp))
 
                 completed = 0
-                with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as executor:
+                with concurrent.futures.ProcessPoolExecutor(max_workers=workers, initializer=_set_low_priority) as executor:
                     futures = {executor.submit(_convert_and_process_page, a): a[2] for a in convert_args}
                     for future in concurrent.futures.as_completed(futures):
                         completed += 1
