@@ -88,9 +88,9 @@ class MainWindow(QMainWindow):
 
         toolbar.addSeparator()
 
-        self.action_auto_detect = QAction(f"Auto-D{U}etect", self)
+        self.action_auto_detect = QAction(f"Auto Align A{U}ll", self)
         self.action_auto_detect.setShortcut(QKeySequence("Ctrl+D"))
-        self.action_auto_detect.setToolTip("Auto-Detect (Ctrl+D)")
+        self.action_auto_detect.setToolTip("Match and align all pieces (Ctrl+D)")
         self.action_auto_detect.triggered.connect(self.on_auto_detect)
         toolbar.addAction(self.action_auto_detect)
 
@@ -393,9 +393,9 @@ class MainWindow(QMainWindow):
             self.view.fit_all()
             self._update_snap_enabled()
             self._auto_save_layout()
-            self.status_bar.showMessage("Auto-detect complete.")
+            self.status_bar.showMessage("Auto-alignment complete.")
 
-        self._run_with_progress("Auto-detecting placements", task, on_done=on_done)
+        self._run_with_progress("Aligning all pieces", task, on_done=on_done)
 
     # --- Snap ---
 
