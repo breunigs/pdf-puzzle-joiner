@@ -640,22 +640,21 @@ class ThumbnailWidget(QWidget):
     def __init__(self, piece: PuzzlePiece):
         super().__init__()
         self.piece = piece
-        self.setFixedWidth(120)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(4, 4, 4, 4)
-        layout.setSpacing(2)
+        layout.setContentsMargins(2, 2, 2, 2)
+        layout.setSpacing(1)
 
         self.thumb_label = QLabel()
         self.thumb_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.thumb_label.setFixedHeight(90)
         self.thumb_label.setScaledContents(False)
+        self.thumb_label.setFixedHeight(64)
         layout.addWidget(self.thumb_label)
 
         self.name_label = QLabel()
         self.name_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.name_label.setWordWrap(True)
+        self.name_label.setWordWrap(False)
         font = QFont()
-        font.setPointSize(7)
+        font.setPointSize(9)
         self.name_label.setFont(font)
         layout.addWidget(self.name_label)
 
@@ -667,7 +666,7 @@ class ThumbnailWidget(QWidget):
         piece = self.piece
         if piece.thumbnail:
             scaled = piece.thumbnail.scaled(
-                110, 80,
+                94, 64,
                 Qt.AspectRatioMode.KeepAspectRatio,
                 Qt.TransformationMode.SmoothTransformation,
             )
@@ -710,7 +709,7 @@ class ThumbnailWidget(QWidget):
         if piece.is_locked:
             self.setStyleSheet("QWidget { border: 2px solid orange; }")
         else:
-            self.setStyleSheet("")
+            self.setStyleSheet("QWidget { border: 2px solid transparent; }")
 
     def set_selected(self, selected: bool):
         if selected:
@@ -718,7 +717,7 @@ class ThumbnailWidget(QWidget):
         elif self.piece.is_locked:
             self.setStyleSheet("QWidget { border: 2px solid orange; }")
         else:
-            self.setStyleSheet("")
+            self.setStyleSheet("QWidget { border: 2px solid transparent; }")
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -734,7 +733,7 @@ class ThumbnailPanel(QWidget):
 
     def __init__(self):
         super().__init__()
-        self.setFixedHeight(130)
+        self.setFixedHeight(105)
         self.thumb_widgets: dict = {}  # PuzzlePiece -> ThumbnailWidget
 
         outer_layout = QVBoxLayout(self)
