@@ -86,13 +86,9 @@ class MainWindow(QMainWindow):
 
         toolbar.addSeparator()
 
-        self.action_export_layered = QAction("Export Layered TIFF", self)
-        self.action_export_layered.triggered.connect(self.on_export_layered)
-        toolbar.addAction(self.action_export_layered)
-
-        self.action_export_flat = QAction("Export Flat TIFF", self)
-        self.action_export_flat.triggered.connect(self.on_export_flat)
-        toolbar.addAction(self.action_export_flat)
+        self.action_export = QAction("Export TIFF", self)
+        self.action_export.triggered.connect(self.on_export)
+        toolbar.addAction(self.action_export)
 
         toolbar.addSeparator()
 
@@ -412,43 +408,29 @@ class MainWindow(QMainWindow):
 
     # --- Export ---
 
-    def on_export_layered(self):
+    def on_export(self):
         if not self.pieces:
             return
         path, _ = QFileDialog.getSaveFileName(
-            self, "Export Layered TIFF", "puzzle_layered.tif", "TIFF (*.tif *.tiff)"
+            self, "Export TIFF", "puzzle.tif", "TIFF (*.tif *.tiff)"
         )
         if not path:
             return
 
-        def task(progress):
-            progress.emit(10, "Exporting layered TIFF...")
-            export_layered_tiff(self.pieces, path)
-            progress.emit(95, "Done.")
-            return path
-
-        def on_done(out_path):
-            self.status_bar.showMessage(f"Exported: {out_path}")
-
-        self._run_with_progress("Exporting", task, on_done=on_done)
-
-    def on_export_flat(self):
-        if not self.pieces:
-            return
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Export Flattened TIFF", "puzzle_flat.tif", "TIFF (*.tif *.tiff)"
-        )
-        if not path:
-            return
+        base, ext = os.path.splitext(path)
+        layered_path = f"{base}_layered{ext}"
+        flat_path = f"{base}_flat{ext}"
 
         def task(progress):
-            progress.emit(10, "Exporting flattened TIFF...")
-            export_flattened_tiff(self.pieces, path)
+            progress.emit(5, "Exporting layered TIFF...")
+            export_layered_tiff(self.pieces, layered_path)
+            progress.emit(50, "Exporting flattened TIFF...")
+            export_flattened_tiff(self.pieces, flat_path)
             progress.emit(95, "Done.")
-            return path
+            return (layered_path, flat_path)
 
-        def on_done(out_path):
-            self.status_bar.showMessage(f"Exported: {out_path}")
+        def on_done(paths):
+            self.status_bar.showMessage(f"Exported: {paths[0]} and {paths[1]}")
 
         self._run_with_progress("Exporting", task, on_done=on_done)
 

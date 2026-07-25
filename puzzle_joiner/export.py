@@ -1,4 +1,5 @@
 import math
+import os
 
 import cv2
 import numpy as np
@@ -37,7 +38,7 @@ def export_layered_tiff(pieces: list, output_path: str):
                 photometric="rgb",
                 tile=(1024, 1024),
                 compression="deflate",
-                extratags=[(285, tifffile.DATATYPE.ASCII, 0, piece.source_path, False)],
+                extratags=[(285, tifffile.DATATYPE.ASCII, 0, os.path.basename(piece.source_path), False)],
             )
 
 
