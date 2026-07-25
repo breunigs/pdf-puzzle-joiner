@@ -1,5 +1,6 @@
 import os
 import math
+import re
 import subprocess
 from typing import Optional
 
@@ -513,6 +514,10 @@ class ThumbnailWidget(QWidget):
                 self.thumb_label.setPixmap(scaled)
 
         name = os.path.basename(piece.source_path)
+        # Parse "page_0003.png" → "Page 3"
+        m = re.match(r"page_0*(\d+)\.\w+$", name)
+        if m:
+            name = f"Page {m.group(1)}"
         extra = ""
         if piece.is_locked:
             extra = " [L]"

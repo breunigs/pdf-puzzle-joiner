@@ -1,11 +1,21 @@
 import math
 import os
+import re
 
 import cv2
 import numpy as np
 import tifffile
 
 from .model import PuzzlePiece
+
+
+def _layer_name(piece: PuzzlePiece) -> str:
+    """Derive a human-readable layer name from source_path."""
+    name = os.path.basename(piece.source_path)
+    m = re.match(r"page_0*(\d+)\.\w+$", name)
+    if m:
+        return f"Page {m.group(1)}"
+    return name
 
 
 def export_layered_tiff(pieces: list, output_path: str):
@@ -38,7 +48,7 @@ def export_layered_tiff(pieces: list, output_path: str):
                 photometric="rgb",
                 tile=(1024, 1024),
                 compression="deflate",
-                extratags=[(285, tifffile.DATATYPE.ASCII, 0, os.path.basename(piece.source_path), False)],
+                extratags=[(285, tifffile.DATATYPE.ASCII, 0, _layer_name(piece), False)],
             )
 
 
