@@ -159,13 +159,13 @@ def split_pdf_pages(pdf_path: str, work_dir: str, pages=None) -> list:
 
 
 def _convert_and_process_page(args):
-    """Worker: convert single PDF page to PNG, crop borders, remove legend, save to cache.
+    """Worker: convert single PDF page to PNG, compute crop rect, save uncropped to cache.
 
     Args:
         args: (pdf_page_path, page_num, idx, cache_path)
 
     Returns:
-        (cache_path, bgra_array, idx) or None
+        (cache_path, bgra_array, crop_rect_or_None, idx) or None
     """
     pdf_page_path, page_num, idx, cache_path = args
     png_path = pdf_page_path.replace(".pdf", ".png")
@@ -180,12 +180,15 @@ def _convert_and_process_page(args):
     img = cv2.imread(png_path, cv2.IMREAD_COLOR)
     if img is None:
         return None
-    img = autocrop_border_lines(img)
-    img = remove_legend(img)
+    crop_rect = compute_auto_crop_rect(img)
     bgra = cv2.cvtColor(img, cv2.COLOR_BGR2BGRA)
     if cache_path:
         cv2.imwrite(cache_path, bgra)
-    return (cache_path or png_path, bgra, idx)
+        cache_dir = os.path.dirname(cache_path)
+        ac_path = _cached_autocrop_path(cache_dir, page_num)
+        with open(ac_path, "w") as f:
+            json.dump(crop_rect, f)
+    return (cache_path or png_path, bgra, crop_rect, idx)
 
 
 def pdf_page_info(pdf_path: str) -> tuple:
@@ -249,6 +252,40 @@ def _cached_page_path(cache_dir: str, page_num: int) -> str:
     return os.path.join(cache_dir, f"page_{page_num:04d}.png")
 
 
+def _cached_autocrop_path(cache_dir: str, page_num: int) -> str:
+    """Path for a cached auto-crop rect JSON (1-indexed)."""
+    return os.path.join(cache_dir, f"page_{page_num:04d}_autocrop.json")
+
+
+def _load_cached_page(args):
+    """Worker: load cached page PNG and read or compute auto-crop rect.
+
+    Args:
+        args: (page_num, cache_path, idx)
+
+    Returns:
+        (cache_path, bgra_array, crop_rect_or_None, idx) or None
+    """
+    page_num, cp, idx = args
+    bgra = cv2.imread(cp, cv2.IMREAD_UNCHANGED)
+    if bgra is None:
+        return None
+    cache_dir = os.path.dirname(cp)
+    ac_path = _cached_autocrop_path(cache_dir, page_num)
+    crop_rect = None
+    if os.path.exists(ac_path):
+        with open(ac_path, "r") as f:
+            data = json.load(f)
+        if data is not None:
+            crop_rect = tuple(data)
+    else:
+        bgr = cv2.cvtColor(bgra, cv2.COLOR_BGRA2BGR)
+        crop_rect = compute_auto_crop_rect(bgr)
+        with open(ac_path, "w") as f:
+            json.dump(crop_rect, f)
+    return (cp, bgra, crop_rect, idx)
+
+
 # ---------------------------------------------------------------------------
 # Border-cropping (ported from extract-largest-rectangle-between-lines.py)
 # ---------------------------------------------------------------------------
@@ -292,17 +329,24 @@ def find_largest_empty_rectangle(horizontal_lines, vertical_lines, img_width, im
     return best_rect
 
 
-def autocrop_image(image: np.ndarray, tolerance=5) -> np.ndarray:
+def autocrop_image_rect(image: np.ndarray, tolerance=5) -> tuple:
+    """Returns (x, y, w, h) of the content region, or full image rect if no border."""
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     reference = int(gray[0, 0])
     mask = np.abs(gray.astype(int) - reference) <= tolerance
     content_mask = ~mask
     coords = np.argwhere(content_mask)
+    h, w = image.shape[:2]
     if coords.size == 0:
-        return image
+        return (0, 0, w, h)
     y0, x0 = coords.min(axis=0)
     y1, x1 = coords.max(axis=0) + 1
-    return image[y0:y1, x0:x1]
+    return (int(x0), int(y0), int(x1 - x0), int(y1 - y0))
+
+
+def autocrop_image(image: np.ndarray, tolerance=5) -> np.ndarray:
+    x, y, w, h = autocrop_image_rect(image, tolerance)
+    return image[y:y+h, x:x+w]
 
 
 def autocrop_border_lines(image: np.ndarray) -> np.ndarray:
@@ -544,6 +588,114 @@ def remove_legend(image: np.ndarray) -> np.ndarray:
             result[y1:y2, x1:x2] = 255
 
     return result
+
+
+def compute_auto_crop_rect(image: np.ndarray) -> tuple:
+    """Compute crop rect (x, y, w, h) that border-crop + legend-removal would produce.
+
+    Runs detection on the image without modifying it. Returns rect in original
+    image coordinates, or None if no crop is needed.
+    """
+    img_h, img_w = image.shape[:2]
+
+    # --- Step 1: border detection (same logic as autocrop_border_lines) ---
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    edges = cv2.adaptiveThreshold(
+        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 11, 2
+    )
+    min_length = min(img_w, img_h) * 0.7
+    lines = cv2.HoughLinesP(
+        edges, rho=1, theta=np.pi / 180, threshold=80,
+        minLineLength=min_length, maxLineGap=1,
+    )
+    horizontal_line_coords = []
+    vertical_line_coords = []
+    if lines is not None:
+        for line in lines:
+            x1, y1, x2, y2 = line.flatten().tolist()
+            angle = np.rad2deg(np.arctan2(y2 - y1, x2 - x1))
+            length = np.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
+            if (abs(angle) < 1 or abs(angle - 180) < 1) and length >= 0.7 * img_w:
+                horizontal_line_coords.append(tuple(sorted([(x1, y1), (x2, y2)])))
+            elif (abs(angle - 90) < 1 or abs(angle + 90) < 1) and length >= 0.8 * img_h:
+                vertical_line_coords.append(
+                    tuple(sorted([(x1, y1), (x2, y2)], key=lambda p: p[1]))
+                )
+
+    margin_w = int(img_w * 0.05)
+    v_xs = set(line[0][0] for line in vertical_line_coords)
+    has_left_frame = any(margin_w * 0.3 < x < margin_w * 2 for x in v_xs)
+    has_right_frame = any(x > img_w * 0.95 for x in v_xs)
+    for side, has_frame, x_offset in [
+        ("left", has_left_frame, 0),
+        ("right", has_right_frame, img_w - margin_w),
+    ]:
+        if has_frame:
+            continue
+        strip = edges[:, x_offset:x_offset + margin_w]
+        extra_lines = cv2.HoughLinesP(
+            strip, rho=1, theta=np.pi / 180, threshold=80,
+            minLineLength=min_length, maxLineGap=10,
+        )
+        if extra_lines is None:
+            continue
+        for line in extra_lines:
+            ex1, ey1, ex2, ey2 = line.flatten().tolist()
+            ex1 += x_offset
+            ex2 += x_offset
+            angle = np.rad2deg(np.arctan2(ey2 - ey1, ex2 - ex1))
+            length = np.sqrt((ex2 - ex1) ** 2 + (ey2 - ey1) ** 2)
+            if (abs(angle - 90) < 1 or abs(angle + 90) < 1) and length >= 0.8 * img_h:
+                vertical_line_coords.append(
+                    tuple(sorted([(ex1, ey1), (ex2, ey2)], key=lambda p: p[1]))
+                )
+
+    h_lines = [(l[0][0], l[0][1], l[1][0], l[1][1]) for l in horizontal_line_coords]
+    v_lines = [(l[0][0], l[0][1], l[1][0], l[1][1]) for l in vertical_line_coords]
+
+    bx1, by1, bx2, by2 = find_largest_empty_rectangle(h_lines, v_lines, img_w, img_h)
+
+    # Offset from origin (same +1 as autocrop_border_lines)
+    if bx1 == 0 and by1 == 0 and bx2 == img_w and by2 == img_h:
+        # No border lines found — try autocrop on full image
+        ax, ay, aw, ah = autocrop_image_rect(image, tolerance=5)
+        if ax == 0 and ay == 0 and aw == img_w and ah == img_h:
+            bx1, by1 = 0, 0
+            bw, bh = img_w, img_h
+        else:
+            bx1, by1, bw, bh = ax, ay, aw, ah
+    else:
+        crop_x1, crop_y1 = bx1 + 1, by1 + 1
+        crop_x2, crop_y2 = bx2, by2
+        if crop_x2 <= crop_x1 or crop_y2 <= crop_y1:
+            bx1, by1 = 0, 0
+            bw, bh = img_w, img_h
+        else:
+            sub = image[crop_y1:crop_y2, crop_x1:crop_x2]
+            ax, ay, aw, ah = autocrop_image_rect(sub, tolerance=5)
+            bx1 = crop_x1 + ax
+            by1 = crop_y1 + ay
+            bw, bh = aw, ah
+
+    # --- Step 2: legend detection on the cropped region ---
+    if bw > 0 and bh > 0:
+        sub = image[by1:by1+bh, bx1:bx1+bw]
+        tall_verts = find_tall_verticals(sub)
+        legend_col = find_legend_column(sub, tall_verts)
+        if legend_col:
+            lx_start, lx_end = legend_col
+            sub_w = bw
+            if lx_end >= sub_w - 5:
+                # Right legend: crop from right
+                bw = lx_start
+            elif lx_start <= 5:
+                # Left legend: crop from left
+                bx1 += lx_end
+                bw -= lx_end
+
+    if bx1 == 0 and by1 == 0 and bw == img_w and bh == img_h:
+        return None
+    return (bx1, by1, bw, bh)
 
 
 # ---------------------------------------------------------------------------
@@ -1984,14 +2136,13 @@ class CutToolDialog(QDialog):
 
         layout = QVBoxLayout(self)
 
-        # Show UNROTATED image (original, no rotation)
+        # Show full UNROTATED image so user can see borders/legends
         self.scene = QGraphicsScene()
         self.view = QGraphicsView(self.scene)
         self.view.setDragMode(QGraphicsView.DragMode.NoDrag)
         layout.addWidget(self.view)
 
-        # Load the unrotated image (apply existing crop if any, but no rotation)
-        img = piece.get_cropped_image()
+        img = piece.image  # full uncropped image
         h, w = img.shape[:2]
         rgba = cv2.cvtColor(img, cv2.COLOR_BGRA2RGBA)
         qimg = QImage(rgba.data, rgba.shape[1], rgba.shape[0], rgba.strides[0],
@@ -2001,7 +2152,7 @@ class CutToolDialog(QDialog):
         self.scene.addItem(self._pixmap_item)
         self.scene.setSceneRect(0, 0, w, h)
 
-        # Draw existing crop rect
+        # Draw existing crop rect (coordinates are relative to full image)
         self._rect_item = None
         if piece.crop_rect:
             cx, cy, cw, ch = piece.crop_rect
@@ -2023,7 +2174,7 @@ class CutToolDialog(QDialog):
         buttons.addWidget(self.cancel_btn)
         layout.addLayout(buttons)
 
-        self.label = QLabel("Drag to select crop region")
+        self.label = QLabel("Drag to select crop region (Reset removes all cropping)")
         layout.addWidget(self.label)
 
         # Install event filter on view viewport
@@ -2031,7 +2182,6 @@ class CutToolDialog(QDialog):
 
     def eventFilter(self, obj, event):
         from PySide6.QtCore import QEvent
-        from PySide6.QtGui import QMouseEvent
         if obj is self.view.viewport():
             if event.type() == QEvent.Type.MouseButtonPress and \
                     event.button() == Qt.MouseButton.LeftButton:
@@ -2060,20 +2210,15 @@ class CutToolDialog(QDialog):
     def _apply(self):
         if self._selection_rect and self._selection_rect.width() > 2 and \
                 self._selection_rect.height() > 2:
-            img = self.piece.get_cropped_image()
-            h, w = img.shape[:2]
+            h, w = self.piece.image.shape[:2]
             r = self._selection_rect
             cx = max(0, int(r.left()))
             cy = max(0, int(r.top()))
             cw = min(int(r.width()), w - cx)
             ch = min(int(r.height()), h - cy)
             if cw > 0 and ch > 0:
-                # crop_rect is relative to the current crop
-                if self.piece.crop_rect:
-                    ox, oy, _, _ = self.piece.crop_rect
-                    self.piece.crop_rect = (ox + cx, oy + cy, cw, ch)
-                else:
-                    self.piece.crop_rect = (cx, cy, cw, ch)
+                # Coordinates are directly relative to piece.image (full image)
+                self.piece.crop_rect = (cx, cy, cw, ch)
                 self.accept()
         else:
             QMessageBox.warning(self, "No selection", "Please drag a crop region first.")
@@ -2250,20 +2395,13 @@ class MainWindow(QMainWindow):
             results = []
             total = len(requested)
 
-            # Load cached pages in parallel
+            # Load cached pages in parallel (compute crop rect on load)
             if cached_pages:
-                def _load_cached(item):
-                    page_num, cp, idx = item
-                    bgra = cv2.imread(cp, cv2.IMREAD_UNCHANGED)
-                    if bgra is None:
-                        return None
-                    return (cp, bgra, idx)
-
                 load_args = [(pn, cached_pages[pn], requested.index(pn))
                              for pn in requested if pn in cached_pages]
                 workers = max(1, os.cpu_count() // 2)
-                with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
-                    for i, res in enumerate(executor.map(_load_cached, load_args)):
+                with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as executor:
+                    for i, res in enumerate(executor.map(_load_cached_page, load_args)):
                         if res is not None:
                             results.append(res)
                         progress.emit(5 + int(40 * (i + 1) / len(load_args)),
@@ -2294,16 +2432,16 @@ class MainWindow(QMainWindow):
                         if res is not None:
                             results.append(res)
 
-            # Sort by page index
-            results.sort(key=lambda r: r[2])
+            # Sort by page index (idx is last element)
+            results.sort(key=lambda r: r[-1])
             progress.emit(98, "Done.")
             return results
 
         def on_done(result):
             if result is None:
                 return
-            for (path, bgra, idx) in result:
-                self._add_piece_from_array(bgra, path, idx)
+            for (path, bgra, crop_rect, idx) in result:
+                self._add_piece_from_array(bgra, path, idx, crop_rect=crop_rect)
             n = len(result)
             name = os.path.basename(pdf_path)
             self.status_bar.showMessage(f"Loaded {n} pages from {name}")
@@ -2347,12 +2485,15 @@ class MainWindow(QMainWindow):
 
         self._run_with_progress("Loading images", task, on_done=on_done)
 
-    def _add_piece_from_array(self, bgra: np.ndarray, source_path: str, idx: int):
+    def _add_piece_from_array(self, bgra: np.ndarray, source_path: str, idx: int,
+                              crop_rect: tuple = None):
         piece = PuzzlePiece()
         piece.source_path = source_path
         piece.image = bgra
         piece.layer_index = idx
-        h, w = bgra.shape[:2]
+        piece.crop_rect = crop_rect
+        img = piece.get_cropped_image()
+        h, w = img.shape[:2]
         # Default position: stacked horizontally
         piece.x = w / 2.0 + idx * (w + 20)
         piece.y = h / 2.0
