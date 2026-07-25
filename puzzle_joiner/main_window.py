@@ -58,61 +58,73 @@ class MainWindow(QMainWindow):
         toolbar = QToolBar("Main Toolbar")
         self.addToolBar(toolbar)
 
-        self.action_open_pdf = QAction("Open PDF (Ctrl+O)", self)
+        U = "\u0332"  # combining low line — underlines preceding character
+
+        self.action_open_pdf = QAction(f"O{U}pen PDF", self)
         self.action_open_pdf.setShortcut(QKeySequence("Ctrl+O"))
+        self.action_open_pdf.setToolTip("Open PDF (Ctrl+O)")
         self.action_open_pdf.triggered.connect(self.on_open_pdf)
         toolbar.addAction(self.action_open_pdf)
 
-        self.action_open_images = QAction("Open Images (Ctrl+I)", self)
+        self.action_open_images = QAction(f"Open I{U}mages", self)
         self.action_open_images.setShortcut(QKeySequence("Ctrl+I"))
+        self.action_open_images.setToolTip("Open Images (Ctrl+I)")
         self.action_open_images.triggered.connect(self.on_open_images)
         toolbar.addAction(self.action_open_images)
 
         toolbar.addSeparator()
 
-        self.action_undo = self.undo_stack.createUndoAction(self, "Undo (Ctrl+Z)")
+        self.action_undo = self.undo_stack.createUndoAction(self, "Undo")
         self.action_undo.setShortcut(QKeySequence.StandardKey.Undo)
+        self.action_undo.setToolTip("Undo (Ctrl+Z)")
         toolbar.addAction(self.action_undo)
 
-        self.action_redo = self.undo_stack.createRedoAction(self, "Redo (Ctrl+Y)")
+        self.action_redo = self.undo_stack.createRedoAction(self, "Redo")
         self.action_redo.setShortcut(QKeySequence.StandardKey.Redo)
+        self.action_redo.setToolTip("Redo (Ctrl+Y)")
         toolbar.addAction(self.action_redo)
 
         toolbar.addSeparator()
 
-        self.action_auto_detect = QAction("Auto-Detect (Ctrl+D)", self)
+        self.action_auto_detect = QAction(f"Auto-D{U}etect", self)
         self.action_auto_detect.setShortcut(QKeySequence("Ctrl+D"))
+        self.action_auto_detect.setToolTip("Auto-Detect (Ctrl+D)")
         self.action_auto_detect.triggered.connect(self.on_auto_detect)
         toolbar.addAction(self.action_auto_detect)
 
-        self.action_snap = QAction("Snap (Ctrl+S)", self)
+        self.action_snap = QAction(f"S{U}nap", self)
         self.action_snap.setShortcut(QKeySequence("Ctrl+S"))
+        self.action_snap.setToolTip("Snap (Ctrl+S)")
         self.action_snap.triggered.connect(self.on_snap)
         toolbar.addAction(self.action_snap)
 
         toolbar.addSeparator()
 
-        self.action_cut = QAction("Crop (Ctrl+X)", self)
+        self.action_cut = QAction(f"Crop (X{U})", self)
         self.action_cut.setShortcut(QKeySequence("Ctrl+X"))
+        self.action_cut.setToolTip("Crop (Ctrl+X)")
         self.action_cut.triggered.connect(self.on_cut)
         toolbar.addAction(self.action_cut)
 
-        self.action_lock = QAction("Lock/Unlock (Ctrl+L)", self)
+        self.action_lock = QAction(f"L{U}ock/Unlock", self)
         self.action_lock.setShortcut(QKeySequence("Ctrl+L"))
+        self.action_lock.setToolTip("Lock/Unlock (Ctrl+L)")
         self.action_lock.triggered.connect(self.on_lock_toggle)
         toolbar.addAction(self.action_lock)
 
         toolbar.addSeparator()
 
-        self.action_export = QAction("Export TIFF (Ctrl+E)", self)
+        self.action_export = QAction(f"E{U}xport TIFF", self)
         self.action_export.setShortcut(QKeySequence("Ctrl+E"))
+        self.action_export.setToolTip("Export TIFF (Ctrl+E)")
         self.action_export.triggered.connect(self.on_export)
         toolbar.addAction(self.action_export)
 
         toolbar.addSeparator()
 
-        self.action_fit = QAction("Fit View (Ctrl+F)", self)
+        self.action_fit = QAction(f"F{U}it View", self)
         self.action_fit.setShortcut(QKeySequence("Ctrl+F"))
+        self.action_fit.setToolTip("Fit View (Ctrl+F)")
         self.action_fit.triggered.connect(self.on_fit_view)
         toolbar.addAction(self.action_fit)
 
