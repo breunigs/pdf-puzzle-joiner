@@ -503,17 +503,21 @@ def remove_legend(image: np.ndarray) -> np.ndarray:
 # ORB feature matching
 # ---------------------------------------------------------------------------
 
-def compute_orb_features(image: np.ndarray, nfeatures=16000, mask=None):
+def compute_orb_features(image: np.ndarray, nfeatures=16000, mask=None, gray_masking=True):
     orb = cv2.ORB_create(nfeatures=nfeatures, WTA_K=4)
     all_keypoints = []
     all_descriptors = []
     # Work on 3-channel slice
     bgr = image[:, :, :3] if image.shape[2] >= 3 else image
-    gray_mask = (bgr[:, :, 0] == bgr[:, :, 1]) & (bgr[:, :, 1] == bgr[:, :, 2])
+    if gray_masking:
+        gray_mask = (bgr[:, :, 0] == bgr[:, :, 1]) & (bgr[:, :, 1] == bgr[:, :, 2])
     for ch in cv2.split(bgr):
-        ch_copy = ch.copy()
-        ch_copy[gray_mask] = 255
-        kp, des = orb.detectAndCompute(ch_copy, mask)
+        if gray_masking:
+            ch_copy = ch.copy()
+            ch_copy[gray_mask] = 255
+            kp, des = orb.detectAndCompute(ch_copy, mask)
+        else:
+            kp, des = orb.detectAndCompute(ch, mask)
         if des is not None:
             all_keypoints.extend(kp)
             all_descriptors.append(des)
@@ -863,9 +867,13 @@ def snap_piece_to_neighbors(piece: "PuzzlePiece", neighbors: list):
             continue
         neighbor_roi = neighbor_img[ny1:ny2, nx1:nx2]
 
-        # Compute features in overlap
-        kp_p, des_p = compute_orb_features(piece_roi, nfeatures=50000)
-        kp_n, des_n = compute_orb_features(neighbor_roi, nfeatures=50000)
+        # Use alpha channel as mask to only match in non-transparent regions
+        piece_alpha = piece_roi[:, :, 3] if piece_roi.shape[2] == 4 else None
+        neighbor_alpha = neighbor_roi[:, :, 3] if neighbor_roi.shape[2] == 4 else None
+
+        # Compute features in overlap — no gray masking (matches stitch-images-realign)
+        kp_p, des_p = compute_orb_features(piece_roi, nfeatures=50000, gray_masking=False, mask=piece_alpha)
+        kp_n, des_n = compute_orb_features(neighbor_roi, nfeatures=50000, gray_masking=False, mask=neighbor_alpha)
         if des_p is None or des_n is None or len(kp_p) < 4 or len(kp_n) < 4:
             continue
 
@@ -917,7 +925,7 @@ def snap_piece_to_neighbors(piece: "PuzzlePiece", neighbors: list):
             best_pixel = pct
             best_matrix = M_new_world
 
-    if best_matrix is None:
+    if best_matrix is None or best_pixel < 0.5:
         return False
 
     # Decompose new world matrix to update piece params
@@ -1216,24 +1224,14 @@ class PuzzlePieceItem(QGraphicsPixmapItem):
         h, w = img.shape[:2]
         ds = piece.display_scale
 
-        # The item position = world position of display-center
-        # Display pixmap center in display coords
+        # Display pixmap center in item-local coords
         dcx = (w * ds) / 2.0
         dcy = (h * ds) / 2.0
 
-        # World coords of top-left of display pixmap
-        cos_a = math.cos(math.radians(piece.rotation_deg))
-        sin_a = math.sin(math.radians(piece.rotation_deg))
-        s_ratio = piece.scale / ds  # display-to-world scale ratio
-
-        # setPos sets the position of the item's transform origin in scene coords
-        # Transform origin is at center of bounding rect = (dcx, dcy) in item coords
-        # We want center at (piece.x, piece.y) in world
-        # setPos places item origin (0,0) in scene; we need to compute TL position
-        tl_x = piece.x - s_ratio * (cos_a * dcx - sin_a * dcy)
-        tl_y = piece.y - s_ratio * (sin_a * dcx + cos_a * dcy)
-
-        self.setPos(tl_x, tl_y)
+        # Qt applies setScale/setRotation around transformOriginPoint (dcx, dcy).
+        # The scene position of the origin is always pos + origin, regardless of
+        # rotation/scale. So to place the center at (piece.x, piece.y):
+        self.setPos(piece.x - dcx, piece.y - dcy)
         self.setRotation(piece.rotation_deg)
         self.setScale(piece.scale / ds)
 
@@ -1255,17 +1253,12 @@ class PuzzlePieceItem(QGraphicsPixmapItem):
         dcx = (w * ds) / 2.0
         dcy = (h * ds) / 2.0
 
-        rot = self.rotation()
-        sc = self.scale() * ds  # world scale
-        cos_a = math.cos(math.radians(rot))
-        sin_a = math.sin(math.radians(rot))
         pos = self.pos()
-        s_ratio = sc / ds
-
-        piece.x = pos.x() + s_ratio * (cos_a * dcx - sin_a * dcy)
-        piece.y = pos.y() + s_ratio * (sin_a * dcx + cos_a * dcy)
-        piece.rotation_deg = rot
-        piece.scale = sc
+        # Scene position of center = pos + origin (regardless of rotation/scale)
+        piece.x = pos.x() + dcx
+        piece.y = pos.y() + dcy
+        piece.rotation_deg = self.rotation()
+        piece.scale = self.scale() * ds
 
     def itemChange(self, change, value):
         if change == QGraphicsItem.GraphicsItemChange.ItemPositionHasChanged and not self._syncing:
