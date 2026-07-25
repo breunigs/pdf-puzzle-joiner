@@ -1,5 +1,7 @@
 from PySide6.QtCore import QObject, Signal, QRunnable
 
+from .priority import _set_process_low_priority, _restore_process_priority
+
 
 class WorkerSignals(QObject):
     progress = Signal(int, str)
@@ -16,8 +18,11 @@ class Worker(QRunnable):
         self.signals = WorkerSignals()
 
     def run(self):
+        _set_process_low_priority()
         try:
             result = self.fn(*self.args, **self.kwargs, progress=self.signals.progress)
             self.signals.finished.emit(result)
         except Exception as e:
             self.signals.error.emit(str(e))
+        finally:
+            _restore_process_priority()
