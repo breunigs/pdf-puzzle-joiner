@@ -336,12 +336,22 @@ class PuzzleScene(QGraphicsScene):
         item = PuzzlePieceItem(piece, self)
         self.addItem(item)
         self.piece_items[piece] = item
+        self.update_scene_rect()
         return item
 
     def remove_piece(self, piece: PuzzlePiece):
         item = self.piece_items.pop(piece, None)
         if item:
             self.removeItem(item)
+            self.update_scene_rect()
+
+    def update_scene_rect(self):
+        MARGIN = 20000
+        items_rect = self.itemsBoundingRect()
+        if items_rect.isEmpty():
+            self.setSceneRect(-50000, -50000, 100000, 100000)
+        else:
+            self.setSceneRect(items_rect.adjusted(-MARGIN, -MARGIN, MARGIN, MARGIN))
 
     def get_selected_piece(self) -> Optional[PuzzlePiece]:
         selected = self.selectedItems()
@@ -372,6 +382,7 @@ class PuzzleScene(QGraphicsScene):
     def sync_all_from_pieces(self):
         for piece, item in self.piece_items.items():
             item.sync_from_piece()
+        self.update_scene_rect()
 
 
 class PuzzleView(QGraphicsView):

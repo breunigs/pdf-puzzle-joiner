@@ -125,6 +125,7 @@ class MainWindow(QMainWindow):
         self.scene = PuzzleScene(undo_stack=self.undo_stack)
         self.scene.selection_changed_signal.connect(self.on_scene_selection_changed)
         self.scene.piece_moved_signal.connect(self._update_snap_enabled)
+        self.scene.piece_moved_signal.connect(self.scene.update_scene_rect)
         self.view = PuzzleView(self.scene)
         main_layout.addWidget(self.view, 1)
 
