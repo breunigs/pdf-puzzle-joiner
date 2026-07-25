@@ -21,7 +21,7 @@ from .preprocessing import (
 )
 from .cache import (
     _cache_dir_for_pdf, _cached_page_path, _cached_autocrop_path,
-    _load_cached_page,
+    _load_cached_page, save_layout, load_layout, _images_cache_dir,
 )
 from .matching import auto_detect_placements, snap_piece_to_neighbors
 from .export import export_layered_tiff, export_flattened_tiff
@@ -41,8 +41,10 @@ class MainWindow(QMainWindow):
         self.resize(1400, 900)
         self.pieces: list = []
         self._work_dir = None
+        self._layout_dir: Optional[str] = None
         self._thread_pool = QThreadPool.globalInstance()
         self.undo_stack = QUndoStack(self)
+        self.undo_stack.indexChanged.connect(self._auto_save_layout)
 
         self._build_ui()
 
@@ -227,7 +229,6 @@ class MainWindow(QMainWindow):
 
         def task(progress):
             progress.emit(2, "Computing cache key...")
-            cache_dir = _cache_dir_for_pdf(pdf_path)
 
             # Determine which pages are requested (1-indexed)
             if pages:
@@ -297,11 +298,19 @@ class MainWindow(QMainWindow):
                 return
             for (path, bgra, crop_rect, idx) in result:
                 self._add_piece_from_array(bgra, path, idx, crop_rect=crop_rect)
+            self._layout_dir = cache_dir
+            if load_layout(self._layout_dir, self.pieces):
+                for piece in self.pieces:
+                    piece.rebuild_display_pixmap()
+                    piece.rebuild_thumbnail()
+                self.scene.sync_all_from_pieces()
+                self.thumbnail_panel.update_all()
             n = len(result)
             name = os.path.basename(pdf_path)
             self.status_bar.showMessage(f"Loaded {n} pages from {name}")
             self.view.fit_all()
 
+        cache_dir = _cache_dir_for_pdf(pdf_path)
         self._run_with_progress("Importing PDF", task, on_done=on_done)
 
     def on_open_images(self):
@@ -335,6 +344,13 @@ class MainWindow(QMainWindow):
                 return
             for (path, bgra, idx) in result:
                 self._add_piece_from_array(bgra, path, idx)
+            self._layout_dir = _images_cache_dir(paths)
+            if load_layout(self._layout_dir, self.pieces):
+                for piece in self.pieces:
+                    piece.rebuild_display_pixmap()
+                    piece.rebuild_thumbnail()
+                self.scene.sync_all_from_pieces()
+                self.thumbnail_panel.update_all()
             self.status_bar.showMessage(f"Loaded {len(result)} images")
             self.view.fit_all()
 
@@ -376,6 +392,7 @@ class MainWindow(QMainWindow):
             self.thumbnail_panel.update_all()
             self.view.fit_all()
             self._update_snap_enabled()
+            self._auto_save_layout()
             self.status_bar.showMessage("Auto-detect complete.")
 
         self._run_with_progress("Auto-detecting placements", task, on_done=on_done)
@@ -470,6 +487,7 @@ class MainWindow(QMainWindow):
                 item.rebuild_pixmap()
             piece.rebuild_thumbnail()
             self.thumbnail_panel.update_piece(piece)
+            self._auto_save_layout()
             self.status_bar.showMessage("Crop applied.")
 
     # --- Lock/Unlock ---
@@ -565,3 +583,9 @@ class MainWindow(QMainWindow):
                 cur_idx = 0
             idx = (cur_idx + (1 if forward else -1)) % len(self.pieces)
         self.on_thumbnail_select(self.pieces[idx])
+
+    # --- Auto-save layout ---
+
+    def _auto_save_layout(self):
+        if self._layout_dir and self.pieces:
+            save_layout(self._layout_dir, self.pieces)

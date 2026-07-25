@@ -53,6 +53,71 @@ def _cached_autocrop_path(cache_dir: str, page_num: int) -> str:
     return os.path.join(cache_dir, f"page_{page_num:04d}_autocrop.json")
 
 
+def _layout_path(cache_dir: str) -> str:
+    """Path for the layout JSON file in a cache directory."""
+    return os.path.join(cache_dir, "layout.json")
+
+
+def save_layout(cache_dir: str, pieces) -> None:
+    """Save piece layout state (position, rotation, scale, flags) to cache dir."""
+    if not cache_dir:
+        return
+    entries = []
+    for piece in pieces:
+        entries.append({
+            "source": os.path.basename(piece.source_path),
+            "x": piece.x,
+            "y": piece.y,
+            "rotation_deg": piece.rotation_deg,
+            "scale": piece.scale,
+            "is_matched": piece.is_matched,
+            "is_locked": piece.is_locked,
+            "crop_rect": list(piece.crop_rect) if piece.crop_rect is not None else None,
+        })
+    path = _layout_path(cache_dir)
+    with open(path, "w") as f:
+        json.dump(entries, f, indent=1)
+
+
+def load_layout(cache_dir: str, pieces) -> bool:
+    """Restore piece layout state from cache dir. Returns True if layout was applied."""
+    if not cache_dir:
+        return False
+    path = _layout_path(cache_dir)
+    if not os.path.exists(path):
+        return False
+    with open(path, "r") as f:
+        entries = json.load(f)
+    by_source = {e["source"]: e for e in entries}
+    applied = False
+    for piece in pieces:
+        key = os.path.basename(piece.source_path)
+        e = by_source.get(key)
+        if e is None:
+            continue
+        piece.x = e["x"]
+        piece.y = e["y"]
+        piece.rotation_deg = e["rotation_deg"]
+        piece.scale = e["scale"]
+        piece.is_matched = e.get("is_matched", False)
+        piece.is_locked = e.get("is_locked", False)
+        saved_crop = e.get("crop_rect")
+        if saved_crop is not None:
+            piece.crop_rect = tuple(saved_crop)
+        applied = True
+    return applied
+
+
+def _images_cache_dir(image_paths: list) -> str:
+    """Return a cache directory for a set of image paths, creating it if needed."""
+    md5 = hashlib.md5()
+    for p in sorted(image_paths):
+        md5.update(p.encode())
+    d = os.path.join(CACHE_BASE, "images_" + md5.hexdigest())
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
 def _load_cached_page(args):
     """Worker: load cached page PNG and read or compute auto-crop rect.
 

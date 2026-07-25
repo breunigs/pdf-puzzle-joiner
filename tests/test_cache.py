@@ -1,10 +1,13 @@
+import json
 import os
 import time
 
 from puzzle_joiner.cache import (
     _cached_page_path, _cached_autocrop_path,
     cleanup_old_cache_entries, _CACHE_MAX_AGE_SECONDS,
+    save_layout, load_layout, _images_cache_dir,
 )
+from puzzle_joiner.model import PuzzlePiece
 
 
 class TestCachePaths:
@@ -55,3 +58,102 @@ class TestCacheCleanup:
     def test_nonexistent_cache_base(self, monkeypatch):
         monkeypatch.setattr("puzzle_joiner.cache.CACHE_BASE", "/nonexistent/path")
         cleanup_old_cache_entries()  # should not raise
+
+
+def _make_piece(source_path, x=0.0, y=0.0, rotation=0.0, scale=1.0,
+                matched=False, locked=False, crop_rect=None):
+    import numpy as np
+    p = PuzzlePiece()
+    p.source_path = source_path
+    p.image = np.zeros((10, 10, 4), dtype=np.uint8)
+    p.x = x
+    p.y = y
+    p.rotation_deg = rotation
+    p.scale = scale
+    p.is_matched = matched
+    p.is_locked = locked
+    p.crop_rect = crop_rect
+    return p
+
+
+class TestSaveLoadLayout:
+    def test_round_trip(self, tmp_path):
+        pieces = [
+            _make_piece("/cache/page_0001.png", x=100, y=200, rotation=45,
+                        scale=1.5, matched=True, locked=True, crop_rect=(10, 20, 30, 40)),
+            _make_piece("/cache/page_0002.png", x=300, y=400),
+        ]
+        save_layout(str(tmp_path), pieces)
+
+        # Create fresh pieces with default state
+        restored = [
+            _make_piece("/cache/page_0001.png"),
+            _make_piece("/cache/page_0002.png"),
+        ]
+        assert load_layout(str(tmp_path), restored)
+
+        assert restored[0].x == 100
+        assert restored[0].y == 200
+        assert restored[0].rotation_deg == 45
+        assert restored[0].scale == 1.5
+        assert restored[0].is_matched is True
+        assert restored[0].is_locked is True
+        assert restored[0].crop_rect == (10, 20, 30, 40)
+        assert restored[1].x == 300
+        assert restored[1].y == 400
+
+    def test_no_layout_file(self, tmp_path):
+        pieces = [_make_piece("/cache/page_0001.png")]
+        assert load_layout(str(tmp_path), pieces) is False
+
+    def test_no_cache_dir(self):
+        pieces = [_make_piece("/cache/page_0001.png")]
+        assert load_layout(None, pieces) is False
+        save_layout(None, pieces)  # should not raise
+
+    def test_partial_match(self, tmp_path):
+        """Only pieces with matching source basenames get restored."""
+        pieces = [_make_piece("/cache/page_0001.png", x=100, y=200)]
+        save_layout(str(tmp_path), pieces)
+
+        restored = [
+            _make_piece("/other/page_0001.png"),  # same basename
+            _make_piece("/cache/page_0099.png"),   # no match
+        ]
+        assert load_layout(str(tmp_path), restored)
+        assert restored[0].x == 100
+        assert restored[1].x == 0  # unchanged
+
+    def test_json_format(self, tmp_path):
+        pieces = [_make_piece("/cache/page_0001.png", x=50, locked=True)]
+        save_layout(str(tmp_path), pieces)
+        with open(os.path.join(str(tmp_path), "layout.json")) as f:
+            data = json.load(f)
+        assert len(data) == 1
+        assert data[0]["source"] == "page_0001.png"
+        assert data[0]["x"] == 50
+        assert data[0]["is_locked"] is True
+
+    def test_null_crop_rect(self, tmp_path):
+        pieces = [_make_piece("/cache/page_0001.png", crop_rect=None)]
+        save_layout(str(tmp_path), pieces)
+        restored = [_make_piece("/cache/page_0001.png", crop_rect=(1, 2, 3, 4))]
+        load_layout(str(tmp_path), restored)
+        # null in JSON means "no crop" — don't overwrite with None
+        assert restored[0].crop_rect == (1, 2, 3, 4)
+
+
+class TestImagesCacheDir:
+    def test_deterministic(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("puzzle_joiner.cache.CACHE_BASE", str(tmp_path))
+        d1 = _images_cache_dir(["/a.png", "/b.png"])
+        d2 = _images_cache_dir(["/b.png", "/a.png"])  # order shouldn't matter
+        assert d1 == d2
+        assert os.path.isdir(d1)
+        assert "images_" in os.path.basename(d1)
+
+    def test_different_sets(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("puzzle_joiner.cache.CACHE_BASE", str(tmp_path))
+        d1 = _images_cache_dir(["/a.png"])
+        d2 = _images_cache_dir(["/a.png", "/b.png"])
+        assert d1 != d2
