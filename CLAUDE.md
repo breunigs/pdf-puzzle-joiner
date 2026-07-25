@@ -14,6 +14,7 @@ Python/Qt desktop app for assembling puzzle pieces from scanned PDFs or images. 
 
 ```
 puzzle-joiner              # Entry script (uv shebang, deps, thin launcher)
+Makefile                   # make check: syntax, unit tests, boot test
 puzzle_joiner/
   __init__.py              # Empty
   __main__.py              # main() entry point (also supports python -m puzzle_joiner)
@@ -26,6 +27,13 @@ puzzle_joiner/
   worker.py                # WorkerSignals, Worker (QRunnable pattern)
   widgets.py               # All Qt widgets (handles, piece items, scene, view, thumbnails, dialogs)
   main_window.py           # MainWindow (toolbar, import flow, action handlers)
+tests/
+  test_preprocessing.py    # parse_page_range tests
+  test_matching.py         # decompose_affine tests
+  test_model.py            # PuzzlePiece math (crop, affine, bounding box)
+  test_cache.py            # cache path generation
+  test_priority.py         # LOW_PRIO prefix
+  test_boot.py             # smoke test: MainWindow constructs (offscreen Qt)
 ```
 
 ## Module Responsibilities
@@ -78,3 +86,16 @@ uv run puzzle-joiner
 # or
 python -m puzzle_joiner
 ```
+
+## Checking & Testing
+
+Run `make check` to verify syntax, unit tests, and boot test. Do this instead of manually checking syntax.
+
+```
+make check          # all checks: syntax + test + boot
+make syntax         # Python AST parse of all .py files
+make test           # unit tests (pytest, no display needed)
+make boot           # smoke test: MainWindow constructs (offscreen Qt)
+```
+
+Tests live in `tests/` and cover pure functions (`parse_page_range`, `decompose_affine`, `PuzzlePiece` model math, cache paths, priority). The boot test verifies the full import chain and MainWindow construction.

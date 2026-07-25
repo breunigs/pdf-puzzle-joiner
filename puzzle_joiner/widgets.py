@@ -9,6 +9,7 @@ import numpy as np
 from PySide6.QtWidgets import (
     QGraphicsScene, QGraphicsView,
     QGraphicsPixmapItem, QGraphicsItem, QGraphicsRectItem,
+    QGraphicsPathItem,
     QWidget, QHBoxLayout, QVBoxLayout, QScrollArea, QLabel, QPushButton,
     QDialog, QDialogButtonBox, QLineEdit, QFormLayout,
     QMenu, QFrame, QGridLayout,
@@ -20,7 +21,7 @@ from PySide6.QtCore import (
 )
 from PySide6.QtGui import (
     QPixmap, QImage, QPainter, QPen, QColor, QBrush, QCursor,
-    QFont, QTransform,
+    QFont, QTransform, QPainterPath,
 )
 
 from .model import PuzzlePiece
@@ -900,21 +901,282 @@ class PdfImportDialog(QDialog):
         return parse_page_range(self.page_range_edit.text())
 
 
+_CROP_HANDLE_SIZE = 10
+
+
+class CropHandleItem(QGraphicsRectItem):
+    """Small square knob on the crop rectangle edge/corner."""
+
+    # index: 0-3 corners (TL, TR, BR, BL), 4-7 edges (T, R, B, L)
+    _CURSORS = [
+        Qt.CursorShape.SizeFDiagCursor,   # TL
+        Qt.CursorShape.SizeBDiagCursor,   # TR
+        Qt.CursorShape.SizeFDiagCursor,   # BR
+        Qt.CursorShape.SizeBDiagCursor,   # BL
+        Qt.CursorShape.SizeVerCursor,     # T
+        Qt.CursorShape.SizeHorCursor,     # R
+        Qt.CursorShape.SizeVerCursor,     # B
+        Qt.CursorShape.SizeHorCursor,     # L
+    ]
+
+    def __init__(self, index, crop_rect_item):
+        hs = _CROP_HANDLE_SIZE
+        super().__init__(-hs / 2, -hs / 2, hs, hs)
+        self.index = index
+        self.crop_rect_item = crop_rect_item
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations, True)
+        self.setBrush(QBrush(QColor(255, 255, 255)))
+        self.setPen(QPen(QColor(255, 80, 80), 1))
+        self.setZValue(20)
+        self.setCursor(QCursor(self._CURSORS[index]))
+        self.setAcceptHoverEvents(True)
+        self._dragging = False
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._dragging = True
+            self._drag_start = event.scenePos()
+            self._start_rect = QRectF(self.crop_rect_item.crop_rect)
+            event.accept()
+        else:
+            super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if not self._dragging:
+            return super().mouseMoveEvent(event)
+        event.accept()
+        pos = event.scenePos()
+        r = QRectF(self._start_rect)
+        idx = self.index
+        img_rect = self.crop_rect_item.image_rect
+
+        if idx == 0:    # TL corner
+            r.setTopLeft(pos)
+        elif idx == 1:  # TR corner
+            r.setTopRight(pos)
+        elif idx == 2:  # BR corner
+            r.setBottomRight(pos)
+        elif idx == 3:  # BL corner
+            r.setBottomLeft(pos)
+        elif idx == 4:  # T edge
+            r.setTop(pos.y())
+        elif idx == 5:  # R edge
+            r.setRight(pos.x())
+        elif idx == 6:  # B edge
+            r.setBottom(pos.y())
+        elif idx == 7:  # L edge
+            r.setLeft(pos.x())
+
+        # Normalize and clamp to image bounds
+        r = r.normalized()
+        r = r.intersected(img_rect)
+        if r.width() >= 2 and r.height() >= 2:
+            self.crop_rect_item.set_crop_rect(r)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._dragging = False
+            event.accept()
+        else:
+            super().mouseReleaseEvent(event)
+
+
+class CropRectItem(QGraphicsPathItem):
+    """Crop rectangle with dimmed overlay outside and 8 drag handles."""
+
+    def __init__(self, rect: QRectF, image_rect: QRectF, scene: QGraphicsScene):
+        super().__init__()
+        self.crop_rect = QRectF(rect)
+        self.image_rect = QRectF(image_rect)
+        self._scene = scene
+        scene.addItem(self)
+        self.setZValue(5)
+        self.setPen(QPen(Qt.PenStyle.NoPen))
+        self.setBrush(QBrush(QColor(0, 0, 0, 120)))
+        self.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+
+        # Border pen (drawn as a child rect)
+        self._border = QGraphicsRectItem(self)
+        pen = QPen(QColor(255, 80, 80), 2)
+        pen.setStyle(Qt.PenStyle.DashLine)
+        pen.setCosmetic(True)
+        self._border.setPen(pen)
+        self._border.setBrush(QBrush(Qt.BrushStyle.NoBrush))
+        self._border.setZValue(6)
+
+        # 8 handles: 4 corners + 4 edges
+        self.handles = []
+        for i in range(8):
+            h = CropHandleItem(i, self)
+            scene.addItem(h)
+            self.handles.append(h)
+
+        self._update_path()
+
+    def set_crop_rect(self, r: QRectF):
+        self.crop_rect = QRectF(r)
+        self._update_path()
+
+    def _update_path(self):
+        # Overlay: image rect minus crop rect (dimmed area outside crop)
+        outer = QPainterPath()
+        outer.addRect(self.image_rect)
+        inner = QPainterPath()
+        inner.addRect(self.crop_rect)
+        self.setPath(outer.subtracted(inner))
+
+        # Border
+        self._border.setRect(self.crop_rect)
+
+        # Handle positions
+        r = self.crop_rect
+        positions = [
+            r.topLeft(), r.topRight(), r.bottomRight(), r.bottomLeft(),  # corners
+            QPointF(r.center().x(), r.top()),     # T
+            QPointF(r.right(), r.center().y()),    # R
+            QPointF(r.center().x(), r.bottom()),   # B
+            QPointF(r.left(), r.center().y()),     # L
+        ]
+        for h, p in zip(self.handles, positions):
+            h.setPos(p)
+
+    def remove_from_scene(self):
+        for h in self.handles:
+            self._scene.removeItem(h)
+        self._scene.removeItem(self)
+
+
+class CropView(QGraphicsView):
+    """Zoomable/pannable view for the crop dialog."""
+
+    def __init__(self, scene):
+        super().__init__(scene)
+        self.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        self.setDragMode(QGraphicsView.DragMode.NoDrag)
+        self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        self._panning = False
+        self._pan_start = None
+        self._zoom = 1.0
+        self._mode = None  # "draw", "move", or None
+        self._drag_start = None
+        self._move_start_rect = None
+        self.crop_rect_item: CropRectItem | None = None
+        self._image_rect = QRectF()
+
+    def set_image_rect(self, r: QRectF):
+        self._image_rect = QRectF(r)
+
+    def wheelEvent(self, event):
+        delta = event.angleDelta().y()
+        factor = 1.25 if delta > 0 else 0.8
+        new_zoom = self._zoom * factor
+        new_zoom = max(0.05, min(20.0, new_zoom))
+        factor = new_zoom / self._zoom
+        self._zoom = new_zoom
+        self.scale(factor, factor)
+
+    def _hit_handle(self, event_pos):
+        """Check if viewport pos hits a crop handle."""
+        items = self.items(event_pos)
+        for item in items:
+            if isinstance(item, CropHandleItem):
+                return True
+        return False
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.MiddleButton:
+            self._panning = True
+            self._pan_start = event.pos()
+            self.setCursor(QCursor(Qt.CursorShape.ClosedHandCursor))
+            event.accept()
+        elif event.button() == Qt.MouseButton.LeftButton:
+            # Let handles take priority
+            if self._hit_handle(event.pos()):
+                super().mousePressEvent(event)
+                return
+            scene_pos = self.mapToScene(event.pos())
+            if self.crop_rect_item and self.crop_rect_item.crop_rect.contains(scene_pos):
+                # Start moving the crop rect
+                self._mode = "move"
+                self._drag_start = scene_pos
+                self._move_start_rect = QRectF(self.crop_rect_item.crop_rect)
+                self.setCursor(QCursor(Qt.CursorShape.SizeAllCursor))
+                event.accept()
+            else:
+                # Start drawing a new crop rectangle
+                self._mode = "draw"
+                self._drag_start = scene_pos
+                event.accept()
+        else:
+            super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._panning and self._pan_start is not None:
+            delta = event.pos() - self._pan_start
+            self._pan_start = event.pos()
+            self.horizontalScrollBar().setValue(
+                self.horizontalScrollBar().value() - delta.x()
+            )
+            self.verticalScrollBar().setValue(
+                self.verticalScrollBar().value() - delta.y()
+            )
+            event.accept()
+        elif self._mode == "draw" and self._drag_start is not None:
+            scene_pos = self.mapToScene(event.pos())
+            r = QRectF(self._drag_start, scene_pos).normalized()
+            r = r.intersected(self._image_rect)
+            if r.width() >= 2 and r.height() >= 2:
+                if self.crop_rect_item:
+                    self.crop_rect_item.set_crop_rect(r)
+                else:
+                    self.crop_rect_item = CropRectItem(r, self._image_rect, self.scene())
+            event.accept()
+        elif self._mode == "move" and self._drag_start is not None:
+            scene_pos = self.mapToScene(event.pos())
+            delta = scene_pos - self._drag_start
+            r = self._move_start_rect.translated(delta)
+            img = self._image_rect
+            if r.left() < img.left():
+                r.moveLeft(img.left())
+            if r.top() < img.top():
+                r.moveTop(img.top())
+            if r.right() > img.right():
+                r.moveRight(img.right())
+            if r.bottom() > img.bottom():
+                r.moveBottom(img.bottom())
+            self.crop_rect_item.set_crop_rect(r)
+            event.accept()
+        else:
+            super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if self._panning:
+            self._panning = False
+            self.setCursor(QCursor(Qt.CursorShape.ArrowCursor))
+            event.accept()
+        elif self._mode is not None:
+            self._mode = None
+            self._drag_start = None
+            self._move_start_rect = None
+            self.setCursor(QCursor(Qt.CursorShape.ArrowCursor))
+            event.accept()
+        else:
+            super().mouseReleaseEvent(event)
+
+
 class CutToolDialog(QDialog):
     def __init__(self, piece: PuzzlePiece, parent=None):
         super().__init__(parent)
         self.piece = piece
         self.setWindowTitle(f"Cut - {os.path.basename(piece.source_path)}")
-        self.setMinimumSize(600, 500)
-        self._selection_rect = None
-        self._drag_start = None
+        self.setMinimumSize(800, 600)
 
         layout = QVBoxLayout(self)
 
         # Show full UNROTATED image so user can see borders/legends
         self.scene = QGraphicsScene()
-        self.view = QGraphicsView(self.scene)
-        self.view.setDragMode(QGraphicsView.DragMode.NoDrag)
+        self.view = CropView(self.scene)
         layout.addWidget(self.view)
 
         img = piece.image  # full uncropped image
@@ -925,18 +1187,24 @@ class CutToolDialog(QDialog):
         pm = QPixmap.fromImage(qimg.copy())
         self._pixmap_item = QGraphicsPixmapItem(pm)
         self.scene.addItem(self._pixmap_item)
-        self.scene.setSceneRect(0, 0, w, h)
+        image_rect = QRectF(0, 0, w, h)
+        self.scene.setSceneRect(image_rect)
+        self.view.set_image_rect(image_rect)
 
-        # Draw existing crop rect (coordinates are relative to full image)
-        self._rect_item = None
+        # Initialize crop rect from piece (or full image)
         if piece.crop_rect:
             cx, cy, cw, ch = piece.crop_rect
-            pen = QPen(QColor(255, 80, 80), 2)
-            pen.setStyle(Qt.PenStyle.DashLine)
-            self._rect_item = self.scene.addRect(cx, cy, cw, ch, pen)
+            crop_r = QRectF(cx, cy, cw, ch)
+        else:
+            crop_r = QRectF(image_rect)
+
+        self.view.crop_rect_item = CropRectItem(crop_r, image_rect, self.scene)
 
         self.view.fitInView(self.scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+        t = self.view.transform()
+        self.view._zoom = t.m11()
 
+        # Buttons
         buttons = QHBoxLayout()
         self.apply_btn = QPushButton("Apply")
         self.reset_btn = QPushButton("Reset Crop")
@@ -949,59 +1217,33 @@ class CutToolDialog(QDialog):
         buttons.addWidget(self.cancel_btn)
         layout.addLayout(buttons)
 
-        self.label = QLabel("Drag to select crop region (Reset removes all cropping)")
+        self.label = QLabel(
+            "Drag handles to resize crop. Drag inside to move. "
+            "Draw outside to create new region. Middle-click to pan. Scroll to zoom."
+        )
         layout.addWidget(self.label)
 
-        # Install event filter on view viewport
-        self.view.viewport().installEventFilter(self)
-
-    def eventFilter(self, obj, event):
-        from PySide6.QtCore import QEvent
-        if obj is self.view.viewport():
-            if event.type() == QEvent.Type.MouseButtonPress and \
-                    event.button() == Qt.MouseButton.LeftButton:
-                pos = self.view.mapToScene(event.pos())
-                self._drag_start = pos
-                if self._rect_item:
-                    self.scene.removeItem(self._rect_item)
-                    self._rect_item = None
-                return True
-            elif event.type() == QEvent.Type.MouseMove and self._drag_start:
-                pos = self.view.mapToScene(event.pos())
-                r = QRectF(self._drag_start, pos).normalized()
-                if self._rect_item:
-                    self.scene.removeItem(self._rect_item)
-                pen = QPen(QColor(255, 80, 80), 2)
-                pen.setStyle(Qt.PenStyle.DashLine)
-                self._rect_item = self.scene.addRect(r, pen)
-                self._selection_rect = r
-                return True
-            elif event.type() == QEvent.Type.MouseButtonRelease and \
-                    event.button() == Qt.MouseButton.LeftButton:
-                self._drag_start = None
-                return True
-        return super().eventFilter(obj, event)
-
     def _apply(self):
-        if self._selection_rect and self._selection_rect.width() > 2 and \
-                self._selection_rect.height() > 2:
-            h, w = self.piece.image.shape[:2]
-            r = self._selection_rect
-            cx = max(0, int(r.left()))
-            cy = max(0, int(r.top()))
-            cw = min(int(r.width()), w - cx)
-            ch = min(int(r.height()), h - cy)
-            if cw > 0 and ch > 0:
-                # Coordinates are directly relative to piece.image (full image)
-                self.piece.crop_rect = (cx, cy, cw, ch)
-                self.accept()
-        else:
-            QMessageBox.warning(self, "No selection", "Please drag a crop region first.")
+        cri = self.view.crop_rect_item
+        if cri is None:
+            QMessageBox.warning(self, "No selection", "Please define a crop region first.")
+            return
+        r = cri.crop_rect
+        if r.width() < 2 or r.height() < 2:
+            QMessageBox.warning(self, "Too small", "Crop region is too small.")
+            return
+        h, w = self.piece.image.shape[:2]
+        cx = max(0, int(r.left()))
+        cy = max(0, int(r.top()))
+        cw = min(int(r.width()), w - cx)
+        ch = min(int(r.height()), h - cy)
+        if cw > 0 and ch > 0:
+            self.piece.crop_rect = (cx, cy, cw, ch)
+            self.accept()
 
     def _reset(self):
         self.piece.crop_rect = None
-        if self._rect_item:
-            self.scene.removeItem(self._rect_item)
-            self._rect_item = None
-        self._selection_rect = None
+        if self.view.crop_rect_item:
+            self.view.crop_rect_item.remove_from_scene()
+            self.view.crop_rect_item = None
         self.accept()
