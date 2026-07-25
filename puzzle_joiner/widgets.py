@@ -112,6 +112,9 @@ class HandleItem(QGraphicsRectItem):
         if event.button() == Qt.MouseButton.LeftButton:
             self._dragging = False
             event.accept()
+            scene = self.scene()
+            if scene and hasattr(scene, 'piece_moved_signal'):
+                scene.piece_moved_signal.emit()
         else:
             super().mouseReleaseEvent(event)
 
@@ -251,6 +254,8 @@ class PuzzlePieceItem(QGraphicsPixmapItem):
             return
         super().mouseReleaseEvent(event)
         self.sync_to_piece()
+        if self.scene_ref and hasattr(self.scene_ref, 'piece_moved_signal'):
+            self.scene_ref.piece_moved_signal.emit()
 
     def paint(self, painter, option, widget=None):
         if self.isSelected():
@@ -275,6 +280,7 @@ class PuzzlePieceItem(QGraphicsPixmapItem):
 
 class PuzzleScene(QGraphicsScene):
     selection_changed_signal = Signal(object)  # piece or None
+    piece_moved_signal = Signal()  # emitted after any piece drag
 
     def __init__(self):
         super().__init__()

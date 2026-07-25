@@ -108,6 +108,7 @@ class MainWindow(QMainWindow):
         # Canvas
         self.scene = PuzzleScene()
         self.scene.selection_changed_signal.connect(self.on_scene_selection_changed)
+        self.scene.piece_moved_signal.connect(self._update_snap_enabled)
         self.view = PuzzleView(self.scene)
         main_layout.addWidget(self.view, 1)
 
@@ -318,6 +319,7 @@ class MainWindow(QMainWindow):
             self.scene.sync_all_from_pieces()
             self.thumbnail_panel.update_all()
             self.view.fit_all()
+            self._update_snap_enabled()
             self.status_bar.showMessage("Auto-detect complete.")
 
         self._run_with_progress("Auto-detecting placements", task, on_done=on_done)
@@ -351,6 +353,7 @@ class MainWindow(QMainWindow):
                 self.status_bar.showMessage("Snap successful.")
             else:
                 self.status_bar.showMessage("Snap found no match.")
+            self._update_snap_enabled()
 
         self._run_with_progress("Snapping piece", task, on_done=on_done)
 
@@ -369,6 +372,7 @@ class MainWindow(QMainWindow):
         def on_done(result):
             self.scene.sync_all_from_pieces()
             self.thumbnail_panel.update_all()
+            self._update_snap_enabled()
             self.status_bar.showMessage("Snap all complete.")
 
         self._run_with_progress("Snapping all pieces", task, on_done=on_done)
@@ -455,8 +459,16 @@ class MainWindow(QMainWindow):
 
     # --- Selection sync ---
 
+    def _update_snap_enabled(self):
+        piece = self.scene.get_selected_piece()
+        if piece is None:
+            self.action_snap.setEnabled(False)
+        else:
+            self.action_snap.setEnabled(bool(self.scene.get_neighbors(piece)))
+
     def on_scene_selection_changed(self, piece):
         self.thumbnail_panel.select_piece(piece)
+        self._update_snap_enabled()
 
     def on_thumbnail_select(self, piece: PuzzlePiece):
         # Clear current selection
@@ -468,3 +480,4 @@ class MainWindow(QMainWindow):
             bb = piece.get_bounding_box()
             self.view.centerOn(bb.center().x(), bb.center().y())
         self.thumbnail_panel.select_piece(piece)
+        self._update_snap_enabled()
