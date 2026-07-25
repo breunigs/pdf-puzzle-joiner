@@ -129,6 +129,10 @@ class HandleItem(QGraphicsRectItem):
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
+            scene = self.scene()
+            if scene and not getattr(scene, 'editing_enabled', True):
+                event.accept()
+                return
             self._dragging = True
             self._drag_start_pos = event.scenePos()
             piece_item = self.parentItem()
@@ -354,6 +358,7 @@ class PuzzleScene(QGraphicsScene):
         super().__init__()
         self.piece_items: dict = {}  # PuzzlePiece -> PuzzlePieceItem
         self.undo_stack = undo_stack
+        self.editing_enabled = True
         self.setSceneRect(-50000, -50000, 100000, 100000)
 
     def add_piece(self, piece: PuzzlePiece) -> PuzzlePieceItem:
@@ -522,7 +527,7 @@ class PuzzleView(QGraphicsView):
 
         if event.button() == Qt.MouseButton.LeftButton:
             item = self._get_selected_item()
-            if item is not None:
+            if item is not None and self.scene().editing_enabled:
                 scene_pos = self.mapToScene(event.pos())
                 hit = self._hit_test_piece(event.pos())
                 piece = item.piece

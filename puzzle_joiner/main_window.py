@@ -9,7 +9,7 @@ import numpy as np
 
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QToolBar, QStatusBar,
-    QFileDialog, QDialog, QMessageBox, QProgressDialog,
+    QFileDialog, QDialog, QMessageBox, QProgressBar, QLabel,
 )
 from PySide6.QtCore import Qt, QTimer, QThreadPool
 from PySide6.QtGui import QAction, QUndoStack, QKeySequence
@@ -143,41 +143,66 @@ class MainWindow(QMainWindow):
         self.view.select_prev.connect(lambda: self._select_adjacent_piece(False))
         main_layout.addWidget(self.view, 1)
 
-        # Status bar
+        # Status bar with embedded progress
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
+        self._progress_label = QLabel()
+        self._progress_bar = QProgressBar()
+        self._progress_bar.setRange(0, 100)
+        self._progress_bar.setMaximumWidth(200)
+        self._progress_label.hide()
+        self._progress_bar.hide()
+        self.status_bar.addPermanentWidget(self._progress_label)
+        self.status_bar.addPermanentWidget(self._progress_bar)
         self.status_bar.showMessage("Ready. Open a PDF or images to begin.")
 
     def _run_with_progress(self, title: str, fn, *args, on_done=None, **kwargs):
-        """Run fn(*args, **kwargs, progress=Signal) in background with QProgressDialog."""
-        dlg = QProgressDialog(title, "Cancel", 0, 100, self)
-        dlg.setWindowTitle(title)
-        dlg.setWindowModality(Qt.WindowModality.WindowModal)
-        dlg.setMinimumDuration(0)
-        dlg.setValue(0)
+        """Run fn(*args, **kwargs, progress=Signal) in background with inline progress bar."""
+        self._set_actions_enabled(False)
+        self._progress_label.setText(title)
+        self._progress_label.show()
+        self._progress_bar.setValue(0)
+        self._progress_bar.show()
+        self.status_bar.showMessage("")
 
         worker = Worker(fn, *args, **kwargs)
 
         def on_progress(pct, msg):
-            dlg.setValue(pct)
-            dlg.setLabelText(msg)
+            self._progress_bar.setValue(pct)
+            self._progress_label.setText(msg)
+
+        def _finish():
+            self._current_worker = None
+            self._progress_bar.hide()
+            self._progress_label.hide()
+            self._set_actions_enabled(True)
 
         def on_finished(result):
-            dlg.setValue(100)
-            dlg.close()
+            _finish()
             if on_done:
                 on_done(result)
 
         def on_error(msg):
-            dlg.close()
+            _finish()
             QMessageBox.critical(self, "Error", msg)
 
         worker.signals.progress.connect(on_progress)
         worker.signals.finished.connect(on_finished)
         worker.signals.error.connect(on_error)
 
+        self._current_worker = worker
         self._thread_pool.start(worker)
-        dlg.exec()
+
+    def _set_actions_enabled(self, enabled: bool):
+        """Enable/disable toolbar actions and canvas editing during background work."""
+        for action in (
+            self.action_open_pdf, self.action_open_images,
+            self.action_auto_detect, self.action_snap,
+            self.action_cut, self.action_lock,
+            self.action_export,
+        ):
+            action.setEnabled(enabled)
+        self.scene.editing_enabled = enabled
 
     # --- PDF / Image loading ---
 
