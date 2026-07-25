@@ -1,0 +1,2168 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#   "PySide6",
+#   "opencv-python",
+#   "numpy",
+#   "tifffile",
+#   "imagecodecs",
+# ]
+# ///
+
+import sys
+import os
+import math
+import glob
+import tempfile
+import subprocess
+import concurrent.futures
+from dataclasses import dataclass, field
+from typing import Optional
+
+import cv2
+import numpy as np
+import tifffile
+
+from PySide6.QtWidgets import (
+    QApplication, QMainWindow, QGraphicsScene, QGraphicsView,
+    QGraphicsPixmapItem, QGraphicsItem, QGraphicsRectItem, QGraphicsEllipseItem,
+    QWidget, QHBoxLayout, QVBoxLayout, QScrollArea, QLabel, QPushButton,
+    QToolBar, QStatusBar, QDialog, QDialogButtonBox, QLineEdit, QFormLayout,
+    QProgressDialog, QFileDialog, QMessageBox, QSizePolicy, QMenu,
+    QAbstractScrollArea, QFrame,
+)
+from PySide6.QtCore import (
+    Qt, QRectF, QPointF, QSizeF, QThread, QObject, Signal, QTimer,
+    QRunnable, QThreadPool,
+)
+from PySide6.QtGui import (
+    QPixmap, QImage, QPainter, QPen, QColor, QBrush, QCursor,
+    QAction, QIcon, QFont, QTransform,
+)
+
+
+# ---------------------------------------------------------------------------
+# Data model
+# ---------------------------------------------------------------------------
+
+class PuzzlePiece:
+    def __init__(self):
+        self.source_path: str = ""
+        self.image: np.ndarray = None          # Full-res BGRA
+        self.thumbnail: QPixmap = None         # 256px preview
+        self.display_pixmap: QPixmap = None    # Reduced-res for canvas
+        self.display_scale: float = 1.0
+        self.x: float = 0.0
+        self.y: float = 0.0
+        self.rotation_deg: float = 0.0
+        self.scale: float = 1.0
+        self.crop_rect: Optional[tuple] = None  # (x, y, w, h) local unrotated coords
+        self.is_matched: bool = False
+        self.is_locked: bool = False
+        self.layer_index: int = 0
+
+    def get_cropped_image(self) -> np.ndarray:
+        if self.crop_rect is not None:
+            cx, cy, cw, ch = self.crop_rect
+            return self.image[cy:cy+ch, cx:cx+cw].copy()
+        return self.image
+
+    def get_affine_matrix(self) -> np.ndarray:
+        """2x3 affine matrix mapping piece-local coords to world coords."""
+        img = self.get_cropped_image()
+        h, w = img.shape[:2]
+        cx, cy = w / 2.0, h / 2.0
+        cos_a = math.cos(math.radians(self.rotation_deg))
+        sin_a = math.sin(math.radians(self.rotation_deg))
+        s = self.scale
+        a = s * cos_a
+        b = -s * sin_a
+        c = s * sin_a
+        d = s * cos_a
+        tx = self.x - a * cx - b * cy
+        ty = self.y - c * cx - d * cy
+        return np.array([[a, b, tx], [c, d, ty]], dtype=np.float64)
+
+    def get_bounding_box(self) -> QRectF:
+        img = self.get_cropped_image()
+        h, w = img.shape[:2]
+        corners = np.array([[0, 0], [w, 0], [w, h], [0, h]], dtype=np.float32).reshape(-1, 1, 2)
+        M = self.get_affine_matrix()
+        transformed = cv2.transform(corners, M).reshape(-1, 2)
+        min_x, min_y = transformed.min(axis=0)
+        max_x, max_y = transformed.max(axis=0)
+        return QRectF(min_x, min_y, max_x - min_x, max_y - min_y)
+
+    def rebuild_display_pixmap(self, max_dim=2048):
+        img = self.get_cropped_image()
+        h, w = img.shape[:2]
+        self.display_scale = min(max_dim / max(w, h, 1), 1.0)
+        if self.display_scale < 1.0:
+            new_w = int(w * self.display_scale)
+            new_h = int(h * self.display_scale)
+            disp = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        else:
+            disp = img.copy()
+        # Convert BGRA -> RGBA for Qt
+        rgba = cv2.cvtColor(disp, cv2.COLOR_BGRA2RGBA)
+        qimg = QImage(rgba.data, rgba.shape[1], rgba.shape[0], rgba.strides[0],
+                      QImage.Format.Format_RGBA8888)
+        self.display_pixmap = QPixmap.fromImage(qimg.copy())
+
+    def rebuild_thumbnail(self, max_dim=256):
+        img = self.get_cropped_image()
+        h, w = img.shape[:2]
+        scale = min(max_dim / max(w, h, 1), 1.0)
+        new_w = max(1, int(w * scale))
+        new_h = max(1, int(h * scale))
+        thumb = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        rgba = cv2.cvtColor(thumb, cv2.COLOR_BGRA2RGBA)
+        qimg = QImage(rgba.data, rgba.shape[1], rgba.shape[0], rgba.strides[0],
+                      QImage.Format.Format_RGBA8888)
+        self.thumbnail = QPixmap.fromImage(qimg.copy())
+
+
+# ---------------------------------------------------------------------------
+# Preprocessing
+# ---------------------------------------------------------------------------
+
+def parse_page_range(text: str) -> list:
+    """Parse '1-3,5,7-8' -> [1,2,3,5,7,8]"""
+    pages = []
+    text = text.strip()
+    if not text or text.lower() == "all":
+        return None
+    for part in text.split(","):
+        part = part.strip()
+        if "-" in part:
+            start, end = part.split("-", 1)
+            pages.extend(range(int(start), int(end) + 1))
+        else:
+            pages.append(int(part))
+    return sorted(set(pages))
+
+
+def split_pdf(pdf_path: str, work_dir: str, pages=None) -> list:
+    """Split PDF into pages, convert to PNG at 300 DPI."""
+    subprocess.run(
+        ["pdfseparate", pdf_path, os.path.join(work_dir, "page_%04d.pdf")],
+        check=True,
+    )
+    pdf_pages = sorted(glob.glob(os.path.join(work_dir, "page_*.pdf")))
+    if pages:
+        pdf_pages = [p for i, p in enumerate(pdf_pages) if (i + 1) in pages]
+    def _convert_page(pdf_page):
+        png_path = pdf_page.replace(".pdf", ".png")
+        subprocess.run(
+            [
+                "convert", "-density", "300", "-background", "white",
+                pdf_page, "-background", "white", "-alpha", "remove",
+                "-trim", "-depth", "8", "-quality", "00", png_path,
+            ],
+            check=True,
+        )
+        return png_path
+
+    workers = max(1, os.cpu_count() // 2)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+        png_paths = list(executor.map(_convert_page, pdf_pages))
+    return png_paths
+
+
+def count_pdf_pages(pdf_path: str) -> int:
+    try:
+        result = subprocess.run(
+            ["pdfinfo", pdf_path], capture_output=True, text=True, check=True
+        )
+        for line in result.stdout.splitlines():
+            if line.startswith("Pages:"):
+                return int(line.split(":")[1].strip())
+    except Exception:
+        pass
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Border-cropping (ported from extract-largest-rectangle-between-lines.py)
+# ---------------------------------------------------------------------------
+
+def find_largest_empty_rectangle(horizontal_lines, vertical_lines, img_width, img_height):
+    y_boundaries = sorted(set([0, img_height] + [line[1] for line in horizontal_lines]))
+    x_boundaries = sorted(set([0, img_width] + [line[0] for line in vertical_lines]))
+
+    max_area = 0
+    best_rect = (0, 0, img_width, img_height)
+
+    for i in range(len(x_boundaries)):
+        for j in range(i + 1, len(x_boundaries)):
+            x1, x2 = x_boundaries[i], x_boundaries[j]
+            for k in range(len(y_boundaries)):
+                for l in range(k + 1, len(y_boundaries)):
+                    y1, y2 = y_boundaries[k], y_boundaries[l]
+
+                    is_valid = True
+                    for h_line in horizontal_lines:
+                        h_x1, h_y, h_x2, _ = h_line
+                        if y1 < h_y < y2 and max(x1, h_x1) < min(x2, h_x2):
+                            is_valid = False
+                            break
+                    if not is_valid:
+                        continue
+
+                    for v_line in vertical_lines:
+                        v_x, v_y1, _, v_y2 = v_line
+                        if x1 < v_x < x2 and max(y1, v_y1) < min(y2, v_y2):
+                            is_valid = False
+                            break
+                    if not is_valid:
+                        continue
+
+                    area = (x2 - x1) * (y2 - y1)
+                    if area > max_area:
+                        max_area = area
+                        best_rect = (x1, y1, x2, y2)
+
+    return best_rect
+
+
+def autocrop_image(image: np.ndarray, tolerance=5) -> np.ndarray:
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    reference = int(gray[0, 0])
+    mask = np.abs(gray.astype(int) - reference) <= tolerance
+    content_mask = ~mask
+    coords = np.argwhere(content_mask)
+    if coords.size == 0:
+        return image
+    y0, x0 = coords.min(axis=0)
+    y1, x1 = coords.max(axis=0) + 1
+    return image[y0:y1, x0:x1]
+
+
+def autocrop_border_lines(image: np.ndarray) -> np.ndarray:
+    """
+    Detect frame/border lines and crop to the largest inner rectangle.
+    Returns the cropped BGR image, or the original if no crop found.
+    """
+    img_height, img_width = image.shape[:2]
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    edges = cv2.adaptiveThreshold(
+        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 11, 2
+    )
+
+    min_length = min(img_width, img_height) * 0.7
+    lines = cv2.HoughLinesP(
+        edges, rho=1, theta=np.pi / 180, threshold=80,
+        minLineLength=min_length, maxLineGap=1,
+    )
+
+    horizontal_line_coords = []
+    vertical_line_coords = []
+
+    if lines is not None:
+        for line in lines:
+            x1, y1, x2, y2 = line.flatten().tolist()
+            angle = np.rad2deg(np.arctan2(y2 - y1, x2 - x1))
+            length = np.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
+            if (abs(angle) < 1 or abs(angle - 180) < 1) and length >= 0.7 * img_width:
+                horizontal_line_coords.append(
+                    tuple(sorted([(x1, y1), (x2, y2)]))
+                )
+            elif (abs(angle - 90) < 1 or abs(angle + 90) < 1) and length >= 0.8 * img_height:
+                vertical_line_coords.append(
+                    tuple(sorted([(x1, y1), (x2, y2)], key=lambda p: p[1]))
+                )
+
+    # Re-scan margins with relaxed gap
+    margin_w = int(img_width * 0.05)
+    v_xs = set(line[0][0] for line in vertical_line_coords)
+    has_left_frame = any(margin_w * 0.3 < x < margin_w * 2 for x in v_xs)
+    has_right_frame = any(x > img_width * 0.95 for x in v_xs)
+
+    for side, has_frame, x_offset in [
+        ("left", has_left_frame, 0),
+        ("right", has_right_frame, img_width - margin_w),
+    ]:
+        if has_frame:
+            continue
+        strip = edges[:, x_offset:x_offset + margin_w]
+        extra_lines = cv2.HoughLinesP(
+            strip, rho=1, theta=np.pi / 180, threshold=80,
+            minLineLength=min_length, maxLineGap=10,
+        )
+        if extra_lines is None:
+            continue
+        for line in extra_lines:
+            ex1, ey1, ex2, ey2 = line.flatten().tolist()
+            ex1 += x_offset
+            ex2 += x_offset
+            angle = np.rad2deg(np.arctan2(ey2 - ey1, ex2 - ex1))
+            length = np.sqrt((ex2 - ex1) ** 2 + (ey2 - ey1) ** 2)
+            if (abs(angle - 90) < 1 or abs(angle + 90) < 1) and length >= 0.8 * img_height:
+                vertical_line_coords.append(
+                    tuple(sorted([(ex1, ey1), (ex2, ey2)], key=lambda p: p[1]))
+                )
+
+    h_lines_for_crop = [(l[0][0], l[0][1], l[1][0], l[1][1]) for l in horizontal_line_coords]
+    v_lines_for_crop = [(l[0][0], l[0][1], l[1][0], l[1][1]) for l in vertical_line_coords]
+
+    x1, y1, x2, y2 = find_largest_empty_rectangle(
+        h_lines_for_crop, v_lines_for_crop, img_width, img_height
+    )
+
+    if x1 == 0 and y1 == 0 and x2 == img_width and y2 == img_height:
+        return image
+
+    crop_x1, crop_y1 = x1 + 1, y1 + 1
+    crop_x2, crop_y2 = x2, y2
+    if crop_x2 > crop_x1 and crop_y2 > crop_y1:
+        cropped = image[crop_y1:crop_y2, crop_x1:crop_x2]
+        return autocrop_image(cropped, tolerance=5)
+    return image
+
+
+# ---------------------------------------------------------------------------
+# Legend removal (ported from hide-legende-in-pic.py)
+# ---------------------------------------------------------------------------
+
+def find_tall_verticals(image: np.ndarray) -> list:
+    height, width = image.shape[:2]
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray, 50, 150)
+    min_len = int(height * 0.7)
+    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=80,
+                            minLineLength=min_len, maxLineGap=10)
+    if lines is None:
+        return []
+    tall_xs = []
+    for i in range(lines.shape[0]):
+        x1, y1, x2, y2 = lines[i].flatten().tolist()
+        if abs(x2 - x1) < 5 and abs(y2 - y1) >= min_len:
+            tall_xs.append((x1 + x2) // 2)
+    if not tall_xs:
+        return []
+    tall_xs.sort()
+    clusters = []
+    for x in tall_xs:
+        if clusters and abs(x - clusters[-1][-1]) < 15:
+            clusters[-1].append(x)
+        else:
+            clusters.append([x])
+    return sorted(int(np.median(c)) for c in clusters)
+
+
+def find_legend_column(image: np.ndarray, tall_verticals: list):
+    if len(tall_verticals) < 2:
+        return None
+    height, width = image.shape[:2]
+    for i in range(len(tall_verticals)):
+        for j in range(i + 1, len(tall_verticals)):
+            left_x = tall_verticals[i]
+            right_x = tall_verticals[j]
+            gap = right_x - left_x
+            gap_pct = gap / width
+            if right_x > width * 0.85 and 0.05 < gap_pct < 0.35:
+                return (left_x, width)
+            if left_x < width * 0.15 and 0.05 < gap_pct < 0.35:
+                return (0, right_x)
+    return None
+
+
+def find_corner_boxes(image: np.ndarray, margin_xs=None) -> list:
+    height, width = image.shape[:2]
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    _, binary = cv2.threshold(gray, 240, 255, cv2.THRESH_BINARY)
+    binary = 255 - binary
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+    contours, _ = cv2.findContours(binary, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+
+    left_edges = [0]
+    right_edges = [width]
+    if margin_xs:
+        for mx in margin_xs:
+            if mx < width * 0.15:
+                left_edges.append(mx)
+            elif mx > width * 0.85:
+                right_edges.append(mx)
+
+    min_area = width * height * 0.005
+    max_area = width * height * 0.15
+    tol = 15
+    boxes = []
+    for c in contours:
+        area = cv2.contourArea(c)
+        if area < min_area or area > max_area:
+            continue
+        x, y, bw, bh = cv2.boundingRect(c)
+        rect_area = bw * bh
+        if rect_area == 0:
+            continue
+        fill_ratio = area / rect_area
+        if fill_ratio < 0.90:
+            continue
+        near_left = any(abs(x - e) < tol for e in left_edges)
+        near_right = any(abs((x + bw) - e) < tol for e in right_edges)
+        near_top = y < tol
+        near_bottom = y + bh > height - tol
+        if not ((near_left or near_right) and (near_top or near_bottom)):
+            continue
+        if bw > width * 0.30 or bh > height * 0.30:
+            continue
+        boxes.append((x, y, bw, bh))
+    return merge_boxes(boxes)
+
+
+def merge_boxes(boxes: list) -> list:
+    if len(boxes) <= 1:
+        return boxes
+    merged = True
+    while merged:
+        merged = False
+        new_boxes = []
+        used = set()
+        for i in range(len(boxes)):
+            if i in used:
+                continue
+            x1, y1, w1, h1 = boxes[i]
+            ax1, ay1, ax2, ay2 = x1, y1, x1 + w1, y1 + h1
+            for j in range(i + 1, len(boxes)):
+                if j in used:
+                    continue
+                x2, y2, w2, h2 = boxes[j]
+                bx1, by1, bx2, by2 = x2, y2, x2 + w2, y2 + h2
+                if ax1 < bx2 and ax2 > bx1 and ay1 < by2 and ay2 > by1:
+                    ax1 = min(ax1, bx1)
+                    ay1 = min(ay1, by1)
+                    ax2 = max(ax2, bx2)
+                    ay2 = max(ay2, by2)
+                    used.add(j)
+                    merged = True
+            new_boxes.append((ax1, ay1, ax2 - ax1, ay2 - ay1))
+            used.add(i)
+        boxes = new_boxes
+    return boxes
+
+
+def remove_legend(image: np.ndarray) -> np.ndarray:
+    """Remove legend column and corner boxes from BGR image."""
+    tall_verts = find_tall_verticals(image)
+    legend_column = find_legend_column(image, tall_verts)
+    corner_boxes = find_corner_boxes(image, margin_xs=tall_verts)
+
+    if not legend_column and not corner_boxes:
+        return image
+
+    height, width = image.shape[:2]
+    result = image.copy()
+
+    if legend_column:
+        lx_start, lx_end = legend_column
+        if lx_end >= width - 5:
+            result = result[:, :lx_start].copy()
+            corner_boxes = [(x, y, w, h) for x, y, w, h in corner_boxes if x + w <= lx_start]
+        elif lx_start <= 5:
+            result = result[:, lx_end:].copy()
+            corner_boxes = [(x - lx_end, y, w, h) for x, y, w, h in corner_boxes if x >= lx_end]
+        else:
+            result[:, lx_start:lx_end] = 255
+
+    new_h, new_w = result.shape[:2]
+    for (x, y, bw, bh) in corner_boxes:
+        pad = 2
+        x1 = max(0, x - pad)
+        y1 = max(0, y - pad)
+        x2 = min(new_w, x + bw + pad)
+        y2 = min(new_h, y + bh + pad)
+        if x2 > x1 and y2 > y1:
+            result[y1:y2, x1:x2] = 255
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# ORB feature matching
+# ---------------------------------------------------------------------------
+
+def compute_orb_features(image: np.ndarray, nfeatures=16000, mask=None):
+    orb = cv2.ORB_create(nfeatures=nfeatures, WTA_K=4)
+    all_keypoints = []
+    all_descriptors = []
+    # Work on 3-channel slice
+    bgr = image[:, :, :3] if image.shape[2] >= 3 else image
+    gray_mask = (bgr[:, :, 0] == bgr[:, :, 1]) & (bgr[:, :, 1] == bgr[:, :, 2])
+    for ch in cv2.split(bgr):
+        ch_copy = ch.copy()
+        ch_copy[gray_mask] = 255
+        kp, des = orb.detectAndCompute(ch_copy, mask)
+        if des is not None:
+            all_keypoints.extend(kp)
+            all_descriptors.append(des)
+    if not all_descriptors:
+        return [], None
+    return all_keypoints, np.vstack(all_descriptors)
+
+
+def _worker_compute_orb(png_path: str, nfeatures: int):
+    """Worker function for ProcessPoolExecutor — loads PNG, computes ORB."""
+    image = cv2.imread(png_path, cv2.IMREAD_UNCHANGED)
+    if image is None:
+        return None
+    if image.ndim == 2:
+        image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGRA)
+    elif image.shape[2] == 3:
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2BGRA)
+    orb = cv2.ORB_create(nfeatures=nfeatures, WTA_K=4)
+    bgr = image[:, :, :3]
+    gray_mask = (bgr[:, :, 0] == bgr[:, :, 1]) & (bgr[:, :, 1] == bgr[:, :, 2])
+    all_keypoints = []
+    all_descriptors = []
+    for ch in cv2.split(bgr):
+        ch_copy = ch.copy()
+        ch_copy[gray_mask] = 255
+        kp, des = orb.detectAndCompute(ch_copy, None)
+        if des is not None:
+            all_keypoints.extend(kp)
+            all_descriptors.append(des)
+    if not all_descriptors:
+        return None
+    keypoints_pts = [kp.pt for kp in all_keypoints]
+    descriptors = np.vstack(all_descriptors)
+    h, w = image.shape[:2]
+    return {"path": png_path, "keypoints": keypoints_pts, "descriptors": descriptors, "w": w, "h": h}
+
+
+def _process_single_page(args):
+    """Worker function for ProcessPoolExecutor — loads PNG, crops, removes legend, returns BGRA array.
+
+    Args:
+        args: tuple of (png_path, page_index)
+
+    Returns:
+        (png_path, bgra_array, page_index) or None if the image could not be read.
+    """
+    png_path, page_index = args
+    img = cv2.imread(png_path, cv2.IMREAD_COLOR)
+    if img is None:
+        return None
+    img = autocrop_border_lines(img)
+    img = remove_legend(img)
+    bgra = cv2.cvtColor(img, cv2.COLOR_BGR2BGRA)
+    return (png_path, bgra, page_index)
+
+
+def decompose_affine(matrix: np.ndarray):
+    """Decompose 2x3 similarity matrix into (tx, ty, rotation_deg, scale)."""
+    a = matrix[0, 0]
+    c = matrix[1, 0]
+    tx = matrix[0, 2]
+    ty = matrix[1, 2]
+    scale = math.sqrt(a * a + c * c)
+    rotation_deg = math.degrees(math.atan2(c, a))
+    return tx, ty, rotation_deg, scale
+
+
+def matching_pixels_pct(data1: dict, data2: dict, matrix: np.ndarray,
+                         bbox2_transformed: np.ndarray, tolerance=15) -> float:
+    h1, w1 = data1["h"], data1["w"]
+    h2, w2 = data2["h"], data2["w"]
+    x_min = max(0, int(np.min(bbox2_transformed[:, 0])))
+    y_min = max(0, int(np.min(bbox2_transformed[:, 1])))
+    x_max = min(w1, int(np.max(bbox2_transformed[:, 0])))
+    y_max = min(h1, int(np.max(bbox2_transformed[:, 1])))
+    if x_max <= x_min or y_max <= y_min:
+        return 0.0
+    w_roi = x_max - x_min
+    h_roi = y_max - y_min
+    M3 = np.vstack([matrix, [0.0, 0.0, 1.0]])
+    T = np.array([[1.0, 0.0, -x_min], [0.0, 1.0, -y_min], [0.0, 0.0, 1.0]], dtype=np.float64)
+    M_roi3 = T @ M3
+    M_roi = M_roi3[:2, :]
+    img1 = data1["image"]
+    img2 = data2["image"]
+    roi2_warped = cv2.warpAffine(img2, M_roi, (w_roi, h_roi),
+                                  flags=cv2.INTER_LINEAR,
+                                  borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    mask2 = np.ones((h2, w2), dtype=np.uint8) * 255
+    mask_warped = cv2.warpAffine(mask2, M_roi, (w_roi, h_roi),
+                                  flags=cv2.INTER_NEAREST,
+                                  borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    valid = mask_warped > 0
+    roi1 = img1[y_min:y_max, x_min:x_max]
+    min_h = min(roi1.shape[0], roi2_warped.shape[0])
+    min_w = min(roi1.shape[1], roi2_warped.shape[1])
+    roi1 = roi1[:min_h, :min_w]
+    roi2_warped = roi2_warped[:min_h, :min_w]
+    valid = valid[:min_h, :min_w]
+    diff = np.abs(roi1.astype(np.int16) - roi2_warped.astype(np.int16))
+    within_tol = np.all(diff <= tolerance, axis=-1)
+    match_map = within_tol & valid
+    valid_pixels = int(valid.sum())
+    if valid_pixels == 0:
+        return 0.0
+    return (int(np.count_nonzero(match_map)) / valid_pixels) * 100.0
+
+
+def estimate_pairwise_transform(data1: dict, data2: dict):
+    """
+    data1, data2: dicts with 'keypoints', 'descriptors', 'image', 'w', 'h'
+    Returns (matrix, overlap_ratios, pixel_match_pct, match_count) or (None, ...)
+    """
+    kp1 = data1["keypoints"]
+    kp2 = data2["keypoints"]
+    des1 = data1["descriptors"]
+    des2 = data2["descriptors"]
+    if des1 is None or des2 is None or len(kp1) < 4 or len(kp2) < 4:
+        return None, (0.0, 0.0, 0.0), 0
+
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+    matches = bf.match(des1, des2)
+    sorted_matches = sorted(matches, key=lambda x: x.distance)
+    top_matches = sorted_matches[:150]
+    if len(top_matches) < 4:
+        return None, (0.0, 0.0, 0.0), 0
+
+    points1 = np.array([kp1[m.queryIdx] for m in top_matches], dtype=np.float32)
+    points2 = np.array([kp2[m.trainIdx] for m in top_matches], dtype=np.float32)
+    matrix, _inliers = cv2.estimateAffinePartial2D(points2, points1)
+    if matrix is None:
+        return None, (0.0, 0.0, 0.0), 0
+
+    w1, h1 = data1["w"], data1["h"]
+    w2, h2 = data2["w"], data2["h"]
+    bbox1 = np.array([[0, 0], [w1, 0], [w1, h1], [0, h1]], dtype=np.float32)
+    bbox2 = np.array([[0, 0], [w2, 0], [w2, h2], [0, h2]], dtype=np.float32)
+    bbox2_t = cv2.transform(bbox2.reshape(-1, 1, 2), matrix).reshape(-1, 2)
+
+    # Intersection area
+    ix1 = max(np.min(bbox1[:, 0]), np.min(bbox2_t[:, 0]))
+    iy1 = max(np.min(bbox1[:, 1]), np.min(bbox2_t[:, 1]))
+    ix2 = min(np.max(bbox1[:, 0]), np.max(bbox2_t[:, 0]))
+    iy2 = min(np.max(bbox1[:, 1]), np.max(bbox2_t[:, 1]))
+    if ix2 > ix1 and iy2 > iy1:
+        intersect = (ix2 - ix1) * (iy2 - iy1)
+    else:
+        intersect = 0.0
+
+    overlap1 = intersect / (w1 * h1) if w1 * h1 > 0 else 0.0
+    overlap2 = intersect / (w2 * h2) if w2 * h2 > 0 else 0.0
+    pixel_pct = matching_pixels_pct(data1, data2, matrix, bbox2_t)
+    return matrix, (overlap1, overlap2, pixel_pct), len(sorted_matches)
+
+
+def auto_detect_placements(pieces: list):
+    """
+    Run pairwise ORB matching for initial placement guesses.
+    Sets piece.x, piece.y, piece.rotation_deg, piece.scale, piece.is_matched.
+    """
+    if not pieces:
+        return
+
+    # Build data dicts from pieces (use display-res for speed)
+    orb_data = []
+    for piece in pieces:
+        img = piece.get_cropped_image()
+        # Use display pixmap resolution for speed
+        h, w = img.shape[:2]
+        ds = piece.display_scale
+        if ds < 1.0:
+            small = cv2.resize(img, (int(w * ds), int(h * ds)), interpolation=cv2.INTER_AREA)
+        else:
+            small = img.copy()
+        kps, des = compute_orb_features(small)
+        if des is None:
+            kps, des = [], None
+        orb_data.append({
+            "image": small,
+            "keypoints": [kp.pt for kp in kps],
+            "descriptors": des,
+            "w": small.shape[1],
+            "h": small.shape[0],
+            "ds": ds,
+        })
+
+    n = len(pieces)
+    placed = [False] * n
+    placed[0] = True
+    pieces[0].x = pieces[0].get_cropped_image().shape[1] / 2.0
+    pieces[0].y = pieces[0].get_cropped_image().shape[0] / 2.0
+    pieces[0].rotation_deg = 0.0
+    pieces[0].scale = 1.0
+    pieces[0].is_matched = True
+
+    changed = True
+    while changed:
+        changed = False
+        for i in range(n):
+            if not placed[i]:
+                continue
+            if orb_data[i]["descriptors"] is None:
+                continue
+            for j in range(n):
+                if placed[j]:
+                    continue
+                if orb_data[j]["descriptors"] is None:
+                    continue
+                matrix, (ov1, ov2, pixel), match_count = estimate_pairwise_transform(
+                    orb_data[i], orb_data[j]
+                )
+                if matrix is None:
+                    continue
+                overlap = max(ov1, ov2)
+                if overlap < 0.05 or overlap > 0.9 or pixel < 75.0:
+                    continue
+
+                # matrix maps piece j coords -> piece i coords (display-res)
+                # Convert to world coords accounting for display_scale and current placement
+                ds_i = orb_data[i]["ds"]
+                ds_j = orb_data[j]["ds"]
+                tx, ty, rot, sc = decompose_affine(matrix)
+                # Scale tx/ty from display-res to full-res
+                tx_world = tx / ds_i
+                ty_world = ty / ds_i
+                # sc in display units: actual scale = sc * ds_j / ds_i
+                sc_world = sc * ds_j / ds_i
+
+                img_j = pieces[j].get_cropped_image()
+                hj, wj = img_j.shape[:2]
+                # Center of piece j in piece i's local coords
+                cj_local_x = tx_world + (wj / 2.0) * sc_world * math.cos(math.radians(rot)) \
+                              - (hj / 2.0) * sc_world * math.sin(math.radians(rot))
+                cj_local_y = ty_world + (wj / 2.0) * sc_world * math.sin(math.radians(rot)) \
+                              + (hj / 2.0) * sc_world * math.cos(math.radians(rot))
+
+                # Piece i's center in world coords
+                ci_world_x = pieces[i].x
+                ci_world_y = pieces[i].y
+                img_i = pieces[i].get_cropped_image()
+                hi, wi = img_i.shape[:2]
+
+                # Translate piece i local coords to world
+                rot_i = math.radians(pieces[i].rotation_deg)
+                cos_i = math.cos(rot_i)
+                sin_i = math.sin(rot_i)
+                s_i = pieces[i].scale
+                world_x = ci_world_x + s_i * (cos_i * (cj_local_x - wi/2) - sin_i * (cj_local_y - hi/2))
+                world_y = ci_world_y + s_i * (sin_i * (cj_local_x - wi/2) + cos_i * (cj_local_y - hi/2))
+
+                pieces[j].x = world_x
+                pieces[j].y = world_y
+                pieces[j].rotation_deg = pieces[i].rotation_deg + rot
+                pieces[j].scale = sc_world * pieces[i].scale
+                pieces[j].is_matched = True
+                placed[j] = True
+                changed = True
+
+    # Place unmatched pieces in a row below
+    unmatched = [i for i in range(n) if not placed[i]]
+    if unmatched:
+        # Find bottom of all placed pieces
+        max_y = 0.0
+        max_h = 0.0
+        for i in range(n):
+            if placed[i]:
+                bb = pieces[i].get_bounding_box()
+                bottom = bb.bottom()
+                h_piece = pieces[i].get_cropped_image().shape[0] * pieces[i].scale
+                if bottom > max_y:
+                    max_y = bottom
+                    max_h = h_piece
+        row_y = max_y + max_h * 0.1 + 100
+        row_x = 0.0
+        for i in unmatched:
+            img = pieces[i].get_cropped_image()
+            h, w = img.shape[:2]
+            pieces[i].x = row_x + w / 2.0
+            pieces[i].y = row_y + h / 2.0
+            pieces[i].rotation_deg = 0.0
+            pieces[i].scale = 1.0
+            pieces[i].is_matched = False
+            row_x += w + 50
+
+
+# ---------------------------------------------------------------------------
+# Snap / realign
+# ---------------------------------------------------------------------------
+
+def snap_piece_to_neighbors(piece: "PuzzlePiece", neighbors: list):
+    """
+    Refine piece placement using ORB feature matching against neighbors.
+    Uses 50000 features; finds geometric overlap region; extracts ROIs.
+    Modifies piece.x, piece.y, piece.rotation_deg, piece.scale in-place.
+    Returns True if snap succeeded.
+    """
+    piece_img = piece.get_cropped_image()
+    ph, pw = piece_img.shape[:2]
+
+    best_matrix = None
+    best_pixel = 0.0
+
+    for neighbor in neighbors:
+        if neighbor is piece:
+            continue
+        neighbor_img = neighbor.get_cropped_image()
+        nh, nw = neighbor_img.shape[:2]
+
+        # World bounding boxes
+        p_bb = piece.get_bounding_box()
+        n_bb = neighbor.get_bounding_box()
+
+        # Geometric overlap in world coords
+        inter = p_bb.intersected(n_bb)
+        if inter.isEmpty() or inter.width() < 10 or inter.height() < 10:
+            continue
+
+        # Piece ROI: map inter from world to piece-local coords
+        M_piece = piece.get_affine_matrix()
+        M_piece_inv = cv2.invertAffineTransform(M_piece)
+
+        inter_corners = np.array([
+            [inter.left(), inter.top()],
+            [inter.right(), inter.top()],
+            [inter.right(), inter.bottom()],
+            [inter.left(), inter.bottom()],
+        ], dtype=np.float32).reshape(-1, 1, 2)
+
+        piece_corners = cv2.transform(inter_corners, M_piece_inv).reshape(-1, 2)
+        px1 = max(0, int(np.min(piece_corners[:, 0])))
+        py1 = max(0, int(np.min(piece_corners[:, 1])))
+        px2 = min(pw, int(np.max(piece_corners[:, 0])))
+        py2 = min(ph, int(np.max(piece_corners[:, 1])))
+        if px2 <= px1 or py2 <= py1:
+            continue
+        piece_roi = piece_img[py1:py2, px1:px2]
+
+        # Neighbor ROI
+        M_neighbor = neighbor.get_affine_matrix()
+        M_neighbor_inv = cv2.invertAffineTransform(M_neighbor)
+        neighbor_corners = cv2.transform(inter_corners, M_neighbor_inv).reshape(-1, 2)
+        nx1 = max(0, int(np.min(neighbor_corners[:, 0])))
+        ny1 = max(0, int(np.min(neighbor_corners[:, 1])))
+        nx2 = min(nw, int(np.max(neighbor_corners[:, 0])))
+        ny2 = min(nh, int(np.max(neighbor_corners[:, 1])))
+        if nx2 <= nx1 or ny2 <= ny1:
+            continue
+        neighbor_roi = neighbor_img[ny1:ny2, nx1:nx2]
+
+        # Compute features in overlap
+        kp_p, des_p = compute_orb_features(piece_roi, nfeatures=50000)
+        kp_n, des_n = compute_orb_features(neighbor_roi, nfeatures=50000)
+        if des_p is None or des_n is None or len(kp_p) < 4 or len(kp_n) < 4:
+            continue
+
+        bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+        matches = sorted(bf.match(des_p, des_n), key=lambda m: m.distance)[:200]
+        if len(matches) < 4:
+            continue
+
+        src_pts = np.float32([kp_p[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
+        dst_pts = np.float32([kp_n[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
+        # matrix_roi: maps piece_roi coords -> neighbor_roi coords
+        matrix_roi, _ = cv2.estimateAffinePartial2D(src_pts, dst_pts)
+        if matrix_roi is None:
+            continue
+
+        # Convert ROI matrix to global: piece local -> neighbor local
+        # P_neighbor_roi = M_roi * (P_piece - piece_roi_offset) + neighbor_roi_offset
+        # P_neighbor = P_neighbor_roi + neighbor_roi_offset_in_local... no:
+        # P_neighbor_local = M_roi * P_piece_roi + corr
+        # P_piece_roi = P_piece_local - (px1, py1)
+        # P_neighbor_local = M_roi * (P_piece_local - (px1, py1)) + (nx1, ny1)
+        R = matrix_roi[:, :2]
+        corr_piece = R @ np.array([px1, py1])
+        neighbor_local_offset = np.array([nx1, ny1])
+        matrix_piece_to_neighbor_local = matrix_roi.copy()
+        matrix_piece_to_neighbor_local[:, 2] = matrix_roi[:, 2] - corr_piece + neighbor_local_offset
+
+        # Now convert to world coords:
+        # P_world = M_neighbor * P_neighbor_local
+        # We want M_new such that piece center maps to new world position.
+        # Actually we want the world transform for the piece:
+        # P_world = M_neighbor * M_piece_to_neighbor_local * P_piece_local
+        M_nb = neighbor.get_affine_matrix()
+        M_nb_hom = np.vstack([M_nb, [0, 0, 1]])
+        M_ptol_hom = np.vstack([matrix_piece_to_neighbor_local, [0, 0, 1]])
+        M_new_world_hom = M_nb_hom @ M_ptol_hom
+        M_new_world = M_new_world_hom[:2, :]
+
+        # Validate with pixel match
+        data_piece = {"image": piece_img, "w": pw, "h": ph}
+        data_neighbor = {"image": neighbor_img, "w": nw, "h": nh}
+        bbox_piece_in_neighbor = cv2.transform(
+            np.array([[0, 0], [pw, 0], [pw, ph], [0, ph]], dtype=np.float32).reshape(-1, 1, 2),
+            matrix_piece_to_neighbor_local
+        ).reshape(-1, 2)
+        pct = matching_pixels_pct(data_neighbor, data_piece, matrix_piece_to_neighbor_local,
+                                   bbox_piece_in_neighbor)
+        if pct > best_pixel:
+            best_pixel = pct
+            best_matrix = M_new_world
+
+    if best_matrix is None:
+        return False
+
+    # Decompose new world matrix to update piece params
+    tx, ty, rot, sc = decompose_affine(best_matrix)
+    img = piece.get_cropped_image()
+    h, w = img.shape[:2]
+    # The matrix: world = M_new_world * local
+    # center in world = M_new_world * [w/2, h/2]
+    cx_l, cy_l = w / 2.0, h / 2.0
+    a, b = best_matrix[0, 0], best_matrix[0, 1]
+    c2, d = best_matrix[1, 0], best_matrix[1, 1]
+    tx2, ty2 = best_matrix[0, 2], best_matrix[1, 2]
+    piece.x = a * cx_l + b * cy_l + tx2
+    piece.y = c2 * cx_l + d * cy_l + ty2
+    piece.scale = math.sqrt(a * a + c2 * c2)
+    piece.rotation_deg = math.degrees(math.atan2(c2, a))
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Export
+# ---------------------------------------------------------------------------
+
+def export_layered_tiff(pieces: list, output_path: str):
+    if not pieces:
+        return
+    boxes = [p.get_bounding_box() for p in pieces]
+    union = boxes[0]
+    for b in boxes[1:]:
+        union = union.united(b)
+    canvas_w = int(math.ceil(union.width()))
+    canvas_h = int(math.ceil(union.height()))
+    origin_x = union.x()
+    origin_y = union.y()
+
+    with tifffile.TiffWriter(output_path, bigtiff=True) as tiff:
+        for piece in pieces:
+            M = piece.get_affine_matrix().copy()
+            M[0, 2] -= origin_x
+            M[1, 2] -= origin_y
+            img = piece.get_cropped_image()
+            warped = cv2.warpAffine(
+                img, M, (canvas_w, canvas_h),
+                flags=cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=(0, 0, 0, 0),
+            )
+            warped_rgba = cv2.cvtColor(warped, cv2.COLOR_BGRA2RGBA)
+            tiff.write(
+                warped_rgba,
+                photometric="rgb",
+                tile=(1024, 1024),
+                compression="deflate",
+                extratags=[(285, tifffile.DATATYPE.ASCII, 0, piece.source_path, False)],
+            )
+
+
+def export_flattened_tiff(pieces: list, output_path: str):
+    if not pieces:
+        return
+    boxes = [p.get_bounding_box() for p in pieces]
+    union = boxes[0]
+    for b in boxes[1:]:
+        union = union.united(b)
+    canvas_w = int(math.ceil(union.width()))
+    canvas_h = int(math.ceil(union.height()))
+    origin_x = union.x()
+    origin_y = union.y()
+
+    canvas = np.zeros((canvas_h, canvas_w, 4), dtype=np.uint8)
+
+    for piece in pieces:
+        M = piece.get_affine_matrix().copy()
+        M[0, 2] -= origin_x
+        M[1, 2] -= origin_y
+        img = piece.get_cropped_image()
+        warped = cv2.warpAffine(
+            img, M, (canvas_w, canvas_h),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=(0, 0, 0, 0),
+        )
+        # Alpha composite: warped over canvas
+        alpha = warped[:, :, 3:4].astype(np.float32) / 255.0
+        canvas_f = canvas.astype(np.float32)
+        warped_f = warped.astype(np.float32)
+        canvas_f = warped_f * alpha + canvas_f * (1.0 - alpha)
+        canvas = np.clip(canvas_f, 0, 255).astype(np.uint8)
+
+    canvas_rgba = cv2.cvtColor(canvas, cv2.COLOR_BGRA2RGBA)
+    tifffile.imwrite(
+        output_path,
+        canvas_rgba,
+        photometric="rgb",
+        tile=(1024, 1024),
+        compression="deflate",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Worker threads
+# ---------------------------------------------------------------------------
+
+class WorkerSignals(QObject):
+    progress = Signal(int, str)
+    finished = Signal(object)
+    error = Signal(str)
+
+
+class Worker(QRunnable):
+    def __init__(self, fn, *args, **kwargs):
+        super().__init__()
+        self.fn = fn
+        self.args = args
+        self.kwargs = kwargs
+        self.signals = WorkerSignals()
+
+    def run(self):
+        try:
+            result = self.fn(*self.args, **self.kwargs, progress=self.signals.progress)
+            self.signals.finished.emit(result)
+        except Exception as e:
+            self.signals.error.emit(str(e))
+
+
+# ---------------------------------------------------------------------------
+# Transform handles
+# ---------------------------------------------------------------------------
+
+HANDLE_SIZE = 8   # pixels on screen
+ROTATE_HANDLE_DIST = 30  # pixels above bounding rect top
+
+
+class HandleItem(QGraphicsRectItem):
+    CORNER = "corner"
+    EDGE = "edge"
+    ROTATE = "rotate"
+
+    def __init__(self, handle_type, index, parent):
+        super().__init__(-HANDLE_SIZE / 2, -HANDLE_SIZE / 2, HANDLE_SIZE, HANDLE_SIZE, parent)
+        self.handle_type = handle_type
+        self.index = index
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, False)
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations, True)
+        self.setAcceptHoverEvents(True)
+        self.setBrush(QBrush(QColor(255, 255, 255)))
+        self.setPen(QPen(QColor(0, 120, 255), 1))
+        self.setZValue(10)
+        self._dragging = False
+        self._drag_start_pos = None
+        self._drag_start_piece_x = 0.0
+        self._drag_start_piece_y = 0.0
+        self._drag_start_scale = 1.0
+        self._drag_start_rot = 0.0
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._dragging = True
+            self._drag_start_pos = event.scenePos()
+            piece_item = self.parentItem()
+            piece = piece_item.piece
+            self._drag_start_piece_x = piece.x
+            self._drag_start_piece_y = piece.y
+            self._drag_start_scale = piece.scale
+            self._drag_start_rot = piece.rotation_deg
+            event.accept()
+        else:
+            super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if not self._dragging:
+            super().mouseMoveEvent(event)
+            return
+        event.accept()
+        piece_item = self.parentItem()
+        piece = piece_item.piece
+        img = piece.get_cropped_image()
+        h, w = img.shape[:2]
+        cx_world = piece.x
+        cy_world = piece.y
+
+        current_pos = event.scenePos()
+
+        if self.handle_type == self.ROTATE:
+            start_angle = math.degrees(math.atan2(
+                self._drag_start_pos.y() - cy_world,
+                self._drag_start_pos.x() - cx_world,
+            ))
+            current_angle = math.degrees(math.atan2(
+                current_pos.y() - cy_world,
+                current_pos.x() - cx_world,
+            ))
+            piece.rotation_deg = self._drag_start_rot + (current_angle - start_angle)
+        else:
+            # Scale from center
+            start_dist = math.sqrt(
+                (self._drag_start_pos.x() - cx_world) ** 2 +
+                (self._drag_start_pos.y() - cy_world) ** 2
+            )
+            current_dist = math.sqrt(
+                (current_pos.x() - cx_world) ** 2 +
+                (current_pos.y() - cy_world) ** 2
+            )
+            if start_dist > 1e-6:
+                ratio = current_dist / start_dist
+                piece.scale = max(0.01, self._drag_start_scale * ratio)
+
+        piece_item.sync_from_piece()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._dragging = False
+            event.accept()
+        else:
+            super().mouseReleaseEvent(event)
+
+
+class TransformHandles:
+    """Manages 9 handle items attached to a PuzzlePieceItem."""
+
+    def __init__(self, piece_item):
+        self.piece_item = piece_item
+        self.handles = []
+        # Corners: TL, TR, BR, BL
+        for i in range(4):
+            h = HandleItem(HandleItem.CORNER, i, piece_item)
+            h.setVisible(False)
+            self.handles.append(h)
+        # Edge midpoints: T, R, B, L
+        for i in range(4):
+            h = HandleItem(HandleItem.EDGE, i, piece_item)
+            h.setVisible(False)
+            self.handles.append(h)
+        # Rotation handle
+        rot = HandleItem(HandleItem.ROTATE, 0, piece_item)
+        rot.setVisible(False)
+        rot.setRect(-6, -6, 12, 12)  # circle-ish
+        rot.setBrush(QBrush(QColor(255, 200, 0)))
+        self.handles.append(rot)
+
+    def update_positions(self):
+        piece = self.piece_item.piece
+        img = piece.get_cropped_image()
+        h, w = img.shape[:2]
+        ds = piece.display_scale
+        dw, dh = w * ds, h * ds  # display-pixmap dimensions
+
+        # In display pixmap space (before piece transform):
+        # corners: TL, TR, BR, BL
+        corners = [(0, 0), (dw, 0), (dw, dh), (0, dh)]
+        for i, (cx, cy) in enumerate(corners):
+            self.handles[i].setPos(cx, cy)
+
+        # Edge midpoints
+        mids = [
+            (dw / 2, 0),
+            (dw, dh / 2),
+            (dw / 2, dh),
+            (0, dh / 2),
+        ]
+        for i, (cx, cy) in enumerate(mids):
+            self.handles[4 + i].setPos(cx, cy)
+
+        # Rotation handle: above top center
+        self.handles[8].setPos(dw / 2, -ROTATE_HANDLE_DIST)
+
+    def set_visible(self, visible: bool):
+        for h in self.handles:
+            h.setVisible(visible)
+
+
+# ---------------------------------------------------------------------------
+# Graphics items
+# ---------------------------------------------------------------------------
+
+class PuzzlePieceItem(QGraphicsPixmapItem):
+    def __init__(self, piece: PuzzlePiece, scene_ref):
+        super().__init__(piece.display_pixmap)
+        self.piece = piece
+        self.scene_ref = scene_ref
+        self._syncing = False
+
+        self.setFlags(
+            QGraphicsItem.GraphicsItemFlag.ItemIsMovable |
+            QGraphicsItem.GraphicsItemFlag.ItemIsSelectable |
+            QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges
+        )
+        self.setTransformOriginPoint(self.boundingRect().center())
+        self.transform_handles = TransformHandles(self)
+        self.sync_from_piece()
+
+    def sync_from_piece(self):
+        self._syncing = True
+        piece = self.piece
+        img = piece.get_cropped_image()
+        h, w = img.shape[:2]
+        ds = piece.display_scale
+
+        # The item position = world position of display-center
+        # Display pixmap center in display coords
+        dcx = (w * ds) / 2.0
+        dcy = (h * ds) / 2.0
+
+        # World coords of top-left of display pixmap
+        cos_a = math.cos(math.radians(piece.rotation_deg))
+        sin_a = math.sin(math.radians(piece.rotation_deg))
+        s_ratio = piece.scale / ds  # display-to-world scale ratio
+
+        # setPos sets the position of the item's transform origin in scene coords
+        # Transform origin is at center of bounding rect = (dcx, dcy) in item coords
+        # We want center at (piece.x, piece.y) in world
+        # setPos places item origin (0,0) in scene; we need to compute TL position
+        tl_x = piece.x - s_ratio * (cos_a * dcx - sin_a * dcy)
+        tl_y = piece.y - s_ratio * (sin_a * dcx + cos_a * dcy)
+
+        self.setPos(tl_x, tl_y)
+        self.setRotation(piece.rotation_deg)
+        self.setScale(piece.scale / ds)
+
+        # Update locked state
+        if piece.is_locked:
+            self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, False)
+        else:
+            self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, True)
+
+        self.transform_handles.update_positions()
+        self._syncing = False
+
+    def sync_to_piece(self):
+        """Write current graphics state back to piece data."""
+        piece = self.piece
+        ds = piece.display_scale
+        img = piece.get_cropped_image()
+        h, w = img.shape[:2]
+        dcx = (w * ds) / 2.0
+        dcy = (h * ds) / 2.0
+
+        rot = self.rotation()
+        sc = self.scale() * ds  # world scale
+        cos_a = math.cos(math.radians(rot))
+        sin_a = math.sin(math.radians(rot))
+        pos = self.pos()
+        s_ratio = sc / ds
+
+        piece.x = pos.x() + s_ratio * (cos_a * dcx - sin_a * dcy)
+        piece.y = pos.y() + s_ratio * (sin_a * dcx + cos_a * dcy)
+        piece.rotation_deg = rot
+        piece.scale = sc
+
+    def itemChange(self, change, value):
+        if change == QGraphicsItem.GraphicsItemChange.ItemPositionHasChanged and not self._syncing:
+            self.sync_to_piece()
+        if change == QGraphicsItem.GraphicsItemChange.ItemSelectedHasChanged:
+            is_sel = bool(value)
+            self.transform_handles.set_visible(is_sel and not self.piece.is_locked)
+            if self.scene_ref and hasattr(self.scene_ref, 'piece_selection_changed'):
+                self.scene_ref.piece_selection_changed(self.piece, is_sel)
+        return super().itemChange(change, value)
+
+    def mousePressEvent(self, event):
+        if self.piece.is_locked:
+            event.ignore()
+            return
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if self.piece.is_locked:
+            event.ignore()
+            return
+        super().mouseReleaseEvent(event)
+        self.sync_to_piece()
+
+    def paint(self, painter, option, widget=None):
+        if self.isSelected():
+            painter.setOpacity(0.5)
+        else:
+            painter.setOpacity(1.0)
+        super().paint(painter, option, widget)
+        if self.isSelected():
+            painter.setOpacity(1.0)
+            pen = QPen(QColor(220, 30, 30), 2)
+            pen.setCosmetic(True)
+            painter.setPen(pen)
+            painter.drawRect(self.boundingRect())
+
+    def rebuild_pixmap(self):
+        self.piece.rebuild_display_pixmap()
+        self.setPixmap(self.piece.display_pixmap)
+        self.setTransformOriginPoint(self.boundingRect().center())
+        self.transform_handles.update_positions()
+        self.sync_from_piece()
+
+
+# ---------------------------------------------------------------------------
+# Scene
+# ---------------------------------------------------------------------------
+
+class PuzzleScene(QGraphicsScene):
+    selection_changed_signal = Signal(object)  # piece or None
+
+    def __init__(self):
+        super().__init__()
+        self.piece_items: dict = {}  # PuzzlePiece -> PuzzlePieceItem
+        self.setSceneRect(-50000, -50000, 100000, 100000)
+
+    def add_piece(self, piece: PuzzlePiece) -> PuzzlePieceItem:
+        item = PuzzlePieceItem(piece, self)
+        self.addItem(item)
+        self.piece_items[piece] = item
+        return item
+
+    def remove_piece(self, piece: PuzzlePiece):
+        item = self.piece_items.pop(piece, None)
+        if item:
+            self.removeItem(item)
+
+    def get_selected_piece(self) -> Optional[PuzzlePiece]:
+        selected = self.selectedItems()
+        if selected:
+            item = selected[0]
+            if isinstance(item, PuzzlePieceItem):
+                return item.piece
+        return None
+
+    def get_neighbors(self, piece: PuzzlePiece, margin=500) -> list:
+        bb = piece.get_bounding_box()
+        expanded = bb.adjusted(-margin, -margin, margin, margin)
+        neighbors = []
+        for p, item in self.piece_items.items():
+            if p is piece:
+                continue
+            if p.get_bounding_box().intersects(expanded):
+                neighbors.append(p)
+        return neighbors
+
+    def piece_selection_changed(self, piece: PuzzlePiece, selected: bool):
+        if selected:
+            self.selection_changed_signal.emit(piece)
+        else:
+            if not self.selectedItems():
+                self.selection_changed_signal.emit(None)
+
+    def sync_all_from_pieces(self):
+        for piece, item in self.piece_items.items():
+            item.sync_from_piece()
+
+
+# ---------------------------------------------------------------------------
+# View
+# ---------------------------------------------------------------------------
+
+class PuzzleView(QGraphicsView):
+    def __init__(self, scene):
+        super().__init__(scene)
+        self.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        self.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        self.setDragMode(QGraphicsView.DragMode.NoDrag)
+        self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        self._panning = False
+        self._pan_start = None
+        self._space_held = False
+        self._zoom = 1.0
+
+    def wheelEvent(self, event):
+        delta = event.angleDelta().y()
+        factor = 1.25 if delta > 0 else 0.8
+        new_zoom = self._zoom * factor
+        new_zoom = max(0.01, min(10.0, new_zoom))
+        factor = new_zoom / self._zoom
+        self._zoom = new_zoom
+        self.scale(factor, factor)
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Space:
+            self._space_held = True
+            self.setCursor(QCursor(Qt.CursorShape.OpenHandCursor))
+        super().keyPressEvent(event)
+
+    def keyReleaseEvent(self, event):
+        if event.key() == Qt.Key.Key_Space:
+            self._space_held = False
+            self.setCursor(QCursor(Qt.CursorShape.ArrowCursor))
+        super().keyReleaseEvent(event)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.MiddleButton or \
+                (event.button() == Qt.MouseButton.LeftButton and self._space_held):
+            self._panning = True
+            self._pan_start = event.pos()
+            self.setCursor(QCursor(Qt.CursorShape.ClosedHandCursor))
+            event.accept()
+        else:
+            super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._panning and self._pan_start is not None:
+            delta = event.pos() - self._pan_start
+            self._pan_start = event.pos()
+            self.horizontalScrollBar().setValue(
+                self.horizontalScrollBar().value() - delta.x()
+            )
+            self.verticalScrollBar().setValue(
+                self.verticalScrollBar().value() - delta.y()
+            )
+            event.accept()
+        else:
+            super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if self._panning:
+            self._panning = False
+            if self._space_held:
+                self.setCursor(QCursor(Qt.CursorShape.OpenHandCursor))
+            else:
+                self.setCursor(QCursor(Qt.CursorShape.ArrowCursor))
+            event.accept()
+        else:
+            super().mouseReleaseEvent(event)
+
+    def fit_all(self):
+        rect = self.scene().itemsBoundingRect()
+        if not rect.isEmpty():
+            self.fitInView(rect.adjusted(-50, -50, 50, 50), Qt.AspectRatioMode.KeepAspectRatio)
+            # Update zoom tracking
+            t = self.transform()
+            self._zoom = t.m11()
+
+
+# ---------------------------------------------------------------------------
+# Thumbnail panel
+# ---------------------------------------------------------------------------
+
+class ThumbnailWidget(QWidget):
+    clicked = Signal(object)  # PuzzlePiece
+    right_clicked = Signal(object, object)  # PuzzlePiece, QPoint
+
+    def __init__(self, piece: PuzzlePiece):
+        super().__init__()
+        self.piece = piece
+        self.setFixedWidth(120)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(2)
+
+        self.thumb_label = QLabel()
+        self.thumb_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.thumb_label.setFixedHeight(90)
+        self.thumb_label.setScaledContents(False)
+        layout.addWidget(self.thumb_label)
+
+        self.name_label = QLabel()
+        self.name_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.name_label.setWordWrap(True)
+        font = QFont()
+        font.setPointSize(7)
+        self.name_label.setFont(font)
+        layout.addWidget(self.name_label)
+
+        self.update_display()
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.customContextMenuRequested.connect(self._on_right_click)
+
+    def update_display(self):
+        piece = self.piece
+        if piece.thumbnail:
+            scaled = piece.thumbnail.scaled(
+                110, 80,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            if piece.is_locked:
+                # Draw lock overlay
+                pm = QPixmap(scaled.size())
+                pm.fill(Qt.GlobalColor.transparent)
+                painter = QPainter(pm)
+                painter.drawPixmap(0, 0, scaled)
+                painter.setPen(QPen(QColor(255, 200, 0), 2))
+                painter.setFont(QFont("monospace", 14, QFont.Weight.Bold))
+                painter.drawText(pm.rect(), Qt.AlignmentFlag.AlignCenter, "L")
+                painter.end()
+                self.thumb_label.setPixmap(pm)
+            elif not piece.is_matched:
+                # Red tint
+                pm = QPixmap(scaled.size())
+                pm.fill(Qt.GlobalColor.transparent)
+                painter = QPainter(pm)
+                painter.drawPixmap(0, 0, scaled)
+                painter.fillRect(pm.rect(), QColor(255, 0, 0, 60))
+                painter.end()
+                self.thumb_label.setPixmap(pm)
+            else:
+                self.thumb_label.setPixmap(scaled)
+
+        name = os.path.basename(piece.source_path)
+        extra = ""
+        if piece.is_locked:
+            extra = " [L]"
+        elif not piece.is_matched:
+            extra = " (!)"
+        self.name_label.setText(name + extra)
+
+        # Border for locked
+        if piece.is_locked:
+            self.setStyleSheet("QWidget { border: 2px solid orange; }")
+        else:
+            self.setStyleSheet("")
+
+    def set_selected(self, selected: bool):
+        if selected:
+            self.setStyleSheet("QWidget { border: 2px solid #4488ff; background: #ddeeff; }")
+        elif self.piece.is_locked:
+            self.setStyleSheet("QWidget { border: 2px solid orange; }")
+        else:
+            self.setStyleSheet("")
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit(self.piece)
+        super().mousePressEvent(event)
+
+    def _on_right_click(self, pos):
+        self.right_clicked.emit(self.piece, self.mapToGlobal(pos))
+
+
+class ThumbnailPanel(QWidget):
+    piece_selected = Signal(object)  # PuzzlePiece
+
+    def __init__(self):
+        super().__init__()
+        self.setFixedHeight(130)
+        self.thumb_widgets: dict = {}  # PuzzlePiece -> ThumbnailWidget
+
+        outer_layout = QVBoxLayout(self)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.scroll_area = QScrollArea()
+        self.scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
+        self.scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setFrameShape(QFrame.Shape.NoFrame)
+        outer_layout.addWidget(self.scroll_area)
+
+        self.container = QWidget()
+        self.inner_layout = QHBoxLayout(self.container)
+        self.inner_layout.setContentsMargins(4, 2, 4, 2)
+        self.inner_layout.setSpacing(4)
+        self.inner_layout.addStretch()
+        self.scroll_area.setWidget(self.container)
+
+    def add_piece(self, piece: PuzzlePiece):
+        w = ThumbnailWidget(piece)
+        w.clicked.connect(self._on_thumb_clicked)
+        w.right_clicked.connect(self._on_thumb_right_clicked)
+        self.thumb_widgets[piece] = w
+        # Insert before the stretch
+        idx = self.inner_layout.count() - 1
+        self.inner_layout.insertWidget(idx, w)
+
+    def remove_piece(self, piece: PuzzlePiece):
+        w = self.thumb_widgets.pop(piece, None)
+        if w:
+            self.inner_layout.removeWidget(w)
+            w.deleteLater()
+
+    def update_piece(self, piece: PuzzlePiece):
+        w = self.thumb_widgets.get(piece)
+        if w:
+            w.update_display()
+
+    def update_all(self):
+        for w in self.thumb_widgets.values():
+            w.update_display()
+
+    def select_piece(self, piece: Optional[PuzzlePiece]):
+        for p, w in self.thumb_widgets.items():
+            w.set_selected(p is piece)
+        if piece:
+            w = self.thumb_widgets.get(piece)
+            if w:
+                self.scroll_area.ensureWidgetVisible(w)
+
+    def _on_thumb_clicked(self, piece: PuzzlePiece):
+        self.piece_selected.emit(piece)
+
+    def _on_thumb_right_clicked(self, piece: PuzzlePiece, global_pos):
+        menu = QMenu(self)
+        if piece.is_locked:
+            action = menu.addAction("Unlock")
+        else:
+            action = menu.addAction("Lock")
+        chosen = menu.exec(global_pos)
+        if chosen:
+            piece.is_locked = not piece.is_locked
+            self.update_piece(piece)
+            self.piece_selected.emit(piece)  # trigger scene update
+
+
+# ---------------------------------------------------------------------------
+# PDF Import Dialog
+# ---------------------------------------------------------------------------
+
+class PdfImportDialog(QDialog):
+    def __init__(self, pdf_path: str, page_count: int, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Import PDF")
+        self.setMinimumWidth(400)
+
+        layout = QFormLayout(self)
+
+        self.path_label = QLabel(os.path.basename(pdf_path))
+        layout.addRow("File:", self.path_label)
+
+        self.page_count_label = QLabel(str(page_count) if page_count else "Unknown")
+        layout.addRow("Total pages:", self.page_count_label)
+
+        self.page_range_edit = QLineEdit("all")
+        self.page_range_edit.setPlaceholderText("e.g. 1-3,5,7-8 or all")
+        layout.addRow("Pages to import:", self.page_range_edit)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addRow(buttons)
+
+    def get_pages(self):
+        return parse_page_range(self.page_range_edit.text())
+
+
+# ---------------------------------------------------------------------------
+# Cut Tool Dialog
+# ---------------------------------------------------------------------------
+
+class CutToolDialog(QDialog):
+    def __init__(self, piece: PuzzlePiece, parent=None):
+        super().__init__(parent)
+        self.piece = piece
+        self.setWindowTitle(f"Cut - {os.path.basename(piece.source_path)}")
+        self.setMinimumSize(600, 500)
+        self._selection_rect = None
+        self._drag_start = None
+
+        layout = QVBoxLayout(self)
+
+        # Show UNROTATED image (original, no rotation)
+        self.scene = QGraphicsScene()
+        self.view = QGraphicsView(self.scene)
+        self.view.setDragMode(QGraphicsView.DragMode.NoDrag)
+        layout.addWidget(self.view)
+
+        # Load the unrotated image (apply existing crop if any, but no rotation)
+        img = piece.get_cropped_image()
+        h, w = img.shape[:2]
+        rgba = cv2.cvtColor(img, cv2.COLOR_BGRA2RGBA)
+        qimg = QImage(rgba.data, rgba.shape[1], rgba.shape[0], rgba.strides[0],
+                      QImage.Format.Format_RGBA8888)
+        pm = QPixmap.fromImage(qimg.copy())
+        self._pixmap_item = QGraphicsPixmapItem(pm)
+        self.scene.addItem(self._pixmap_item)
+        self.scene.setSceneRect(0, 0, w, h)
+
+        # Draw existing crop rect
+        self._rect_item = None
+        if piece.crop_rect:
+            cx, cy, cw, ch = piece.crop_rect
+            pen = QPen(QColor(255, 80, 80), 2)
+            pen.setStyle(Qt.PenStyle.DashLine)
+            self._rect_item = self.scene.addRect(cx, cy, cw, ch, pen)
+
+        self.view.fitInView(self.scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+
+        buttons = QHBoxLayout()
+        self.apply_btn = QPushButton("Apply")
+        self.reset_btn = QPushButton("Reset Crop")
+        self.cancel_btn = QPushButton("Cancel")
+        self.apply_btn.clicked.connect(self._apply)
+        self.reset_btn.clicked.connect(self._reset)
+        self.cancel_btn.clicked.connect(self.reject)
+        buttons.addWidget(self.apply_btn)
+        buttons.addWidget(self.reset_btn)
+        buttons.addWidget(self.cancel_btn)
+        layout.addLayout(buttons)
+
+        self.label = QLabel("Drag to select crop region")
+        layout.addWidget(self.label)
+
+        # Install event filter on view viewport
+        self.view.viewport().installEventFilter(self)
+
+    def eventFilter(self, obj, event):
+        from PySide6.QtCore import QEvent
+        from PySide6.QtGui import QMouseEvent
+        if obj is self.view.viewport():
+            if event.type() == QEvent.Type.MouseButtonPress and \
+                    event.button() == Qt.MouseButton.LeftButton:
+                pos = self.view.mapToScene(event.pos())
+                self._drag_start = pos
+                if self._rect_item:
+                    self.scene.removeItem(self._rect_item)
+                    self._rect_item = None
+                return True
+            elif event.type() == QEvent.Type.MouseMove and self._drag_start:
+                pos = self.view.mapToScene(event.pos())
+                r = QRectF(self._drag_start, pos).normalized()
+                if self._rect_item:
+                    self.scene.removeItem(self._rect_item)
+                pen = QPen(QColor(255, 80, 80), 2)
+                pen.setStyle(Qt.PenStyle.DashLine)
+                self._rect_item = self.scene.addRect(r, pen)
+                self._selection_rect = r
+                return True
+            elif event.type() == QEvent.Type.MouseButtonRelease and \
+                    event.button() == Qt.MouseButton.LeftButton:
+                self._drag_start = None
+                return True
+        return super().eventFilter(obj, event)
+
+    def _apply(self):
+        if self._selection_rect and self._selection_rect.width() > 2 and \
+                self._selection_rect.height() > 2:
+            img = self.piece.get_cropped_image()
+            h, w = img.shape[:2]
+            r = self._selection_rect
+            cx = max(0, int(r.left()))
+            cy = max(0, int(r.top()))
+            cw = min(int(r.width()), w - cx)
+            ch = min(int(r.height()), h - cy)
+            if cw > 0 and ch > 0:
+                # crop_rect is relative to the current crop
+                if self.piece.crop_rect:
+                    ox, oy, _, _ = self.piece.crop_rect
+                    self.piece.crop_rect = (ox + cx, oy + cy, cw, ch)
+                else:
+                    self.piece.crop_rect = (cx, cy, cw, ch)
+                self.accept()
+        else:
+            QMessageBox.warning(self, "No selection", "Please drag a crop region first.")
+
+    def _reset(self):
+        self.piece.crop_rect = None
+        if self._rect_item:
+            self.scene.removeItem(self._rect_item)
+            self._rect_item = None
+        self._selection_rect = None
+        self.accept()
+
+
+# ---------------------------------------------------------------------------
+# Main Window
+# ---------------------------------------------------------------------------
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Puzzle Joiner")
+        self.resize(1400, 900)
+        self.pieces: list = []
+        self._work_dir = None
+        self._thread_pool = QThreadPool.globalInstance()
+
+        self._build_ui()
+
+    def _build_ui(self):
+        # Central widget
+        central = QWidget()
+        self.setCentralWidget(central)
+        main_layout = QVBoxLayout(central)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
+
+        # Toolbar
+        toolbar = QToolBar("Main Toolbar")
+        self.addToolBar(toolbar)
+
+        self.action_open_pdf = QAction("Open PDF", self)
+        self.action_open_pdf.triggered.connect(self.on_open_pdf)
+        toolbar.addAction(self.action_open_pdf)
+
+        self.action_open_images = QAction("Open Images", self)
+        self.action_open_images.triggered.connect(self.on_open_images)
+        toolbar.addAction(self.action_open_images)
+
+        toolbar.addSeparator()
+
+        self.action_auto_detect = QAction("Auto-Detect", self)
+        self.action_auto_detect.triggered.connect(self.on_auto_detect)
+        toolbar.addAction(self.action_auto_detect)
+
+        self.action_snap = QAction("Snap", self)
+        self.action_snap.triggered.connect(self.on_snap)
+        toolbar.addAction(self.action_snap)
+
+        toolbar.addSeparator()
+
+        self.action_cut = QAction("Cut", self)
+        self.action_cut.triggered.connect(self.on_cut)
+        toolbar.addAction(self.action_cut)
+
+        self.action_lock = QAction("Lock/Unlock", self)
+        self.action_lock.triggered.connect(self.on_lock_toggle)
+        toolbar.addAction(self.action_lock)
+
+        toolbar.addSeparator()
+
+        self.action_export_layered = QAction("Export Layered TIFF", self)
+        self.action_export_layered.triggered.connect(self.on_export_layered)
+        toolbar.addAction(self.action_export_layered)
+
+        self.action_export_flat = QAction("Export Flat TIFF", self)
+        self.action_export_flat.triggered.connect(self.on_export_flat)
+        toolbar.addAction(self.action_export_flat)
+
+        toolbar.addSeparator()
+
+        self.action_fit = QAction("Fit View", self)
+        self.action_fit.triggered.connect(self.on_fit_view)
+        toolbar.addAction(self.action_fit)
+
+        # Thumbnail panel
+        self.thumbnail_panel = ThumbnailPanel()
+        self.thumbnail_panel.piece_selected.connect(self.on_thumbnail_select)
+        main_layout.addWidget(self.thumbnail_panel)
+
+        # Canvas
+        self.scene = PuzzleScene()
+        self.scene.selection_changed_signal.connect(self.on_scene_selection_changed)
+        self.view = PuzzleView(self.scene)
+        main_layout.addWidget(self.view, 1)
+
+        # Status bar
+        self.status_bar = QStatusBar()
+        self.setStatusBar(self.status_bar)
+        self.status_bar.showMessage("Ready. Open a PDF or images to begin.")
+
+    def _run_with_progress(self, title: str, fn, *args, on_done=None, **kwargs):
+        """Run fn(*args, **kwargs, progress=Signal) in background with QProgressDialog."""
+        dlg = QProgressDialog(title, "Cancel", 0, 100, self)
+        dlg.setWindowTitle(title)
+        dlg.setWindowModality(Qt.WindowModality.WindowModal)
+        dlg.setMinimumDuration(0)
+        dlg.setValue(0)
+
+        worker = Worker(fn, *args, **kwargs)
+
+        def on_progress(pct, msg):
+            dlg.setValue(pct)
+            dlg.setLabelText(msg)
+
+        def on_finished(result):
+            dlg.setValue(100)
+            dlg.close()
+            if on_done:
+                on_done(result)
+
+        def on_error(msg):
+            dlg.close()
+            QMessageBox.critical(self, "Error", msg)
+
+        worker.signals.progress.connect(on_progress)
+        worker.signals.finished.connect(on_finished)
+        worker.signals.error.connect(on_error)
+
+        self._thread_pool.start(worker)
+        dlg.exec()
+
+    # --- PDF / Image loading ---
+
+    def on_open_pdf(self):
+        pdf_path, _ = QFileDialog.getOpenFileName(
+            self, "Open PDF", "", "PDF files (*.pdf)"
+        )
+        if not pdf_path:
+            return
+
+        page_count = count_pdf_pages(pdf_path)
+        dlg = PdfImportDialog(pdf_path, page_count, self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        pages = dlg.get_pages()
+        self._import_pdf(pdf_path, pages)
+
+    def _import_pdf(self, pdf_path: str, pages):
+        if self._work_dir is None:
+            self._work_dir = tempfile.mkdtemp(prefix="puzzle_joiner_")
+
+        def task(progress):
+            progress.emit(5, "Splitting PDF...")
+            png_paths = split_pdf(pdf_path, self._work_dir, pages)
+            n = max(len(png_paths), 1)
+            workers = max(1, os.cpu_count() // 2)
+            args = [(png_path, idx) for idx, png_path in enumerate(png_paths)]
+            # Use a dict so results can be re-ordered by page index after completion.
+            results_by_idx = {}
+            completed = 0
+            with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as executor:
+                future_to_idx = {executor.submit(_process_single_page, a): a[1] for a in args}
+                for future in concurrent.futures.as_completed(future_to_idx):
+                    completed += 1
+                    pct = 10 + int(80 * completed / n)
+                    progress.emit(pct, f"Processing page {completed}/{len(png_paths)}...")
+                    res = future.result()
+                    if res is not None:
+                        results_by_idx[res[2]] = res
+            # Restore original page order.
+            result = [results_by_idx[i] for i in sorted(results_by_idx)]
+            progress.emit(95, "Done.")
+            return result
+
+        def on_done(result):
+            if result is None:
+                return
+            for (path, bgra, idx) in result:
+                self._add_piece_from_array(bgra, path, idx)
+            self.status_bar.showMessage(f"Loaded {len(result)} pages from {os.path.basename(pdf_path)}")
+            self.view.fit_all()
+
+        self._run_with_progress("Importing PDF", task, on_done=on_done)
+
+    def on_open_images(self):
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Open Images", "",
+            "Images (*.png *.jpg *.jpeg *.tif *.tiff *.bmp *.webp)"
+        )
+        if not paths:
+            return
+        self._import_images(paths)
+
+    def _import_images(self, paths: list):
+        def task(progress):
+            result = []
+            for idx, path in enumerate(paths):
+                pct = int(90 * idx / max(len(paths), 1))
+                progress.emit(pct, f"Loading {os.path.basename(path)}...")
+                img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+                if img is None:
+                    continue
+                if img.ndim == 2:
+                    img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGRA)
+                elif img.shape[2] == 3:
+                    img = cv2.cvtColor(img, cv2.COLOR_BGR2BGRA)
+                result.append((path, img, idx))
+            progress.emit(95, "Done.")
+            return result
+
+        def on_done(result):
+            if not result:
+                return
+            for (path, bgra, idx) in result:
+                self._add_piece_from_array(bgra, path, idx)
+            self.status_bar.showMessage(f"Loaded {len(result)} images")
+            self.view.fit_all()
+
+        self._run_with_progress("Loading images", task, on_done=on_done)
+
+    def _add_piece_from_array(self, bgra: np.ndarray, source_path: str, idx: int):
+        piece = PuzzlePiece()
+        piece.source_path = source_path
+        piece.image = bgra
+        piece.layer_index = idx
+        h, w = bgra.shape[:2]
+        # Default position: stacked horizontally
+        piece.x = w / 2.0 + idx * (w + 20)
+        piece.y = h / 2.0
+        piece.rebuild_display_pixmap()
+        piece.rebuild_thumbnail()
+        self.pieces.append(piece)
+        self.scene.add_piece(piece)
+        self.thumbnail_panel.add_piece(piece)
+
+    # --- Auto-detect ---
+
+    def on_auto_detect(self):
+        if not self.pieces:
+            self.status_bar.showMessage("No pieces loaded.")
+            return
+
+        def task(progress):
+            progress.emit(10, "Computing ORB features...")
+            auto_detect_placements(self.pieces)
+            progress.emit(90, "Syncing positions...")
+            return True
+
+        def on_done(result):
+            self.scene.sync_all_from_pieces()
+            self.thumbnail_panel.update_all()
+            self.view.fit_all()
+            self.status_bar.showMessage("Auto-detect complete.")
+
+        self._run_with_progress("Auto-detecting placements", task, on_done=on_done)
+
+    # --- Snap ---
+
+    def on_snap(self):
+        piece = self.scene.get_selected_piece()
+        if piece is None:
+            # Snap all unmatched
+            self._snap_all()
+            return
+        neighbors = self.scene.get_neighbors(piece)
+        if not neighbors:
+            self.status_bar.showMessage("No neighbors found for snapping.")
+            return
+
+        def task(progress):
+            progress.emit(20, "Computing features...")
+            ok = snap_piece_to_neighbors(piece, neighbors)
+            progress.emit(90, "Done.")
+            return ok
+
+        def on_done(ok):
+            item = self.scene.piece_items.get(piece)
+            if item:
+                item.sync_from_piece()
+            if ok:
+                piece.is_matched = True
+                self.thumbnail_panel.update_piece(piece)
+                self.status_bar.showMessage("Snap successful.")
+            else:
+                self.status_bar.showMessage("Snap found no match.")
+
+        self._run_with_progress("Snapping piece", task, on_done=on_done)
+
+    def _snap_all(self):
+        def task(progress):
+            total = len(self.pieces)
+            for i, piece in enumerate(self.pieces):
+                progress.emit(int(90 * i / max(total, 1)), f"Snapping piece {i+1}/{total}...")
+                neighbors = self.scene.get_neighbors(piece)
+                if neighbors:
+                    ok = snap_piece_to_neighbors(piece, neighbors)
+                    if ok:
+                        piece.is_matched = True
+            return True
+
+        def on_done(result):
+            self.scene.sync_all_from_pieces()
+            self.thumbnail_panel.update_all()
+            self.status_bar.showMessage("Snap all complete.")
+
+        self._run_with_progress("Snapping all pieces", task, on_done=on_done)
+
+    # --- Cut tool ---
+
+    def on_cut(self):
+        piece = self.scene.get_selected_piece()
+        if piece is None:
+            self.status_bar.showMessage("Select a piece first.")
+            return
+        dlg = CutToolDialog(piece, self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            item = self.scene.piece_items.get(piece)
+            if item:
+                item.rebuild_pixmap()
+            piece.rebuild_thumbnail()
+            self.thumbnail_panel.update_piece(piece)
+            self.status_bar.showMessage("Crop applied.")
+
+    # --- Lock/Unlock ---
+
+    def on_lock_toggle(self):
+        piece = self.scene.get_selected_piece()
+        if piece is None:
+            self.status_bar.showMessage("Select a piece first.")
+            return
+        piece.is_locked = not piece.is_locked
+        item = self.scene.piece_items.get(piece)
+        if item:
+            item.sync_from_piece()
+            if piece.is_locked:
+                item.setSelected(False)
+        self.thumbnail_panel.update_piece(piece)
+        state = "locked" if piece.is_locked else "unlocked"
+        self.status_bar.showMessage(f"Piece {state}.")
+
+    # --- Export ---
+
+    def on_export_layered(self):
+        if not self.pieces:
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Layered TIFF", "puzzle_layered.tif", "TIFF (*.tif *.tiff)"
+        )
+        if not path:
+            return
+
+        def task(progress):
+            progress.emit(10, "Exporting layered TIFF...")
+            export_layered_tiff(self.pieces, path)
+            progress.emit(95, "Done.")
+            return path
+
+        def on_done(out_path):
+            self.status_bar.showMessage(f"Exported: {out_path}")
+
+        self._run_with_progress("Exporting", task, on_done=on_done)
+
+    def on_export_flat(self):
+        if not self.pieces:
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Flattened TIFF", "puzzle_flat.tif", "TIFF (*.tif *.tiff)"
+        )
+        if not path:
+            return
+
+        def task(progress):
+            progress.emit(10, "Exporting flattened TIFF...")
+            export_flattened_tiff(self.pieces, path)
+            progress.emit(95, "Done.")
+            return path
+
+        def on_done(out_path):
+            self.status_bar.showMessage(f"Exported: {out_path}")
+
+        self._run_with_progress("Exporting", task, on_done=on_done)
+
+    # --- Fit View ---
+
+    def on_fit_view(self):
+        self.view.fit_all()
+
+    # --- Selection sync ---
+
+    def on_scene_selection_changed(self, piece):
+        self.thumbnail_panel.select_piece(piece)
+
+    def on_thumbnail_select(self, piece: PuzzlePiece):
+        # Clear current selection
+        self.scene.clearSelection()
+        item = self.scene.piece_items.get(piece)
+        if item:
+            item.setSelected(True)
+            # Center view on piece
+            bb = piece.get_bounding_box()
+            self.view.centerOn(bb.center().x(), bb.center().y())
+        self.thumbnail_panel.select_piece(piece)
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def main():
+    app = QApplication(sys.argv)
+    app.setApplicationName("Puzzle Joiner")
+    app.setApplicationVersion("1.0")
+    window = MainWindow()
+    window.show()
+
+    # If files passed on command line, load them
+    args = sys.argv[1:]
+    if args:
+        # Check if PDF
+        if len(args) == 1 and args[0].lower().endswith(".pdf"):
+            QTimer.singleShot(100, lambda: window._import_pdf(args[0], None))
+        else:
+            # Treat as images
+            QTimer.singleShot(100, lambda: window._import_images(args))
+
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
