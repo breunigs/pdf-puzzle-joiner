@@ -139,6 +139,8 @@ class MainWindow(QMainWindow):
         self.scene.piece_moved_signal.connect(self._update_snap_enabled)
         self.scene.piece_moved_signal.connect(self.scene.update_scene_rect)
         self.view = PuzzleView(self.scene)
+        self.view.select_next.connect(lambda: self._select_adjacent_piece(True))
+        self.view.select_prev.connect(lambda: self._select_adjacent_piece(False))
         main_layout.addWidget(self.view, 1)
 
         # Status bar
@@ -524,3 +526,17 @@ class MainWindow(QMainWindow):
             self.view.centerOn(bb.center().x(), bb.center().y())
         self.thumbnail_panel.select_piece(piece)
         self._update_snap_enabled()
+
+    def _select_adjacent_piece(self, forward: bool):
+        if not self.pieces:
+            return
+        current = self.scene.get_selected_piece()
+        if current is None:
+            idx = 0 if forward else len(self.pieces) - 1
+        else:
+            try:
+                cur_idx = self.pieces.index(current)
+            except ValueError:
+                cur_idx = 0
+            idx = (cur_idx + (1 if forward else -1)) % len(self.pieces)
+        self.on_thumbnail_select(self.pieces[idx])

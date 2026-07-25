@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import (
     Qt, QRectF, QPointF, QSizeF, QObject, Signal,
-    QRunnable, QThreadPool,
+    QRunnable, QThreadPool, QEvent,
 )
 from PySide6.QtGui import (
     QPixmap, QImage, QPainter, QPen, QColor, QBrush, QCursor,
@@ -32,6 +32,77 @@ from .preprocessing import parse_page_range
 
 HANDLE_SIZE = 8   # pixels on screen
 ROTATE_HANDLE_DIST = 30  # pixels above bounding rect top
+
+
+def _make_rotate_cursor():
+    """Create a circular-arrow cursor for rotation."""
+    size = 24
+    pm = QPixmap(size, size)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    pen = QPen(QColor(0, 0, 0), 2)
+    p.setPen(pen)
+    # Draw a 270° arc
+    margin = 3
+    rect = QRectF(margin, margin, size - 2 * margin, size - 2 * margin)
+    p.drawArc(rect, 30 * 16, 300 * 16)  # start 30°, span 300°
+    # Arrowhead at the end of the arc (≈330° = 30+300, which is near top-right)
+    # End point of arc at 330° (Qt angles: 0°=3-o'clock, counter-clockwise)
+    cx, cy = size / 2, size / 2
+    r = (size - 2 * margin) / 2
+    end_angle = math.radians(330)
+    ex = cx + r * math.cos(end_angle)
+    ey = cy - r * math.sin(end_angle)
+    # Arrow pointing along the tangent (clockwise direction)
+    tangent = end_angle - math.pi / 2
+    arrow_len = 6
+    a1x = ex + arrow_len * math.cos(tangent + 0.5)
+    a1y = ey - arrow_len * math.sin(tangent + 0.5)
+    a2x = ex + arrow_len * math.cos(tangent - 0.5)
+    a2y = ey - arrow_len * math.sin(tangent - 0.5)
+    path = QPainterPath()
+    path.moveTo(a1x, a1y)
+    path.lineTo(ex, ey)
+    path.lineTo(a2x, a2y)
+    p.drawPath(path)
+    p.end()
+    return QCursor(pm, size // 2, size // 2)
+
+
+_rotate_cursor = None
+
+
+def _get_rotate_cursor():
+    global _rotate_cursor
+    if _rotate_cursor is None:
+        _rotate_cursor = _make_rotate_cursor()
+    return _rotate_cursor
+
+
+def _resize_cursor_for_handle(handle, piece_item):
+    """Pick the correct resize cursor based on handle index and piece rotation."""
+    # Base angles from piece center for each handle (unrotated, y-down coords)
+    if handle.handle_type == HandleItem.CORNER:
+        # TL=0→225°, TR=1→315°, BR=2→45°, BL=3→135°
+        base = [225, 315, 45, 135][handle.index]
+    else:
+        # T=0→270°, R=1→0°, B=2→90°, L=3→180°
+        base = [270, 0, 90, 180][handle.index]
+    angle = (base + piece_item.piece.rotation_deg) % 360
+    sector = int((angle + 22.5) / 45) % 8
+    # 0=E, 1=SE, 2=S, 3=SW, 4=W, 5=NW, 6=N, 7=NE
+    cursors = [
+        Qt.CursorShape.SizeHorCursor,     # 0 E
+        Qt.CursorShape.SizeFDiagCursor,   # 1 SE  (\)
+        Qt.CursorShape.SizeVerCursor,     # 2 S
+        Qt.CursorShape.SizeBDiagCursor,   # 3 SW  (/)
+        Qt.CursorShape.SizeHorCursor,     # 4 W
+        Qt.CursorShape.SizeFDiagCursor,   # 5 NW  (\)
+        Qt.CursorShape.SizeVerCursor,     # 6 N
+        Qt.CursorShape.SizeBDiagCursor,   # 7 NE  (/)
+    ]
+    return QCursor(cursors[sector])
 
 
 class HandleItem(QGraphicsRectItem):
@@ -122,7 +193,7 @@ class HandleItem(QGraphicsRectItem):
                        piece.scale != self._drag_start_scale)
             if changed:
                 desc = "Rotate" if self.handle_type == self.ROTATE else "Scale"
-                piece_item._push_transform_command(
+                piece_item.push_transform_command(
                     self._drag_start_piece_x, self._drag_start_piece_y,
                     self._drag_start_rot, self._drag_start_scale, desc,
                 )
@@ -195,10 +266,11 @@ class PuzzlePieceItem(QGraphicsPixmapItem):
         self._syncing = False
 
         self.setFlags(
-            QGraphicsItem.GraphicsItemFlag.ItemIsMovable |
             QGraphicsItem.GraphicsItemFlag.ItemIsSelectable |
             QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges
         )
+        # Selection is managed via thumbnail panel, not canvas clicks
+        self.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
         self.setTransformOriginPoint(self.boundingRect().center())
         self.transform_handles = TransformHandles(self)
         self.sync_from_piece()
@@ -221,34 +293,10 @@ class PuzzlePieceItem(QGraphicsPixmapItem):
         self.setRotation(piece.rotation_deg)
         self.setScale(piece.scale / ds)
 
-        # Update locked state
-        if piece.is_locked:
-            self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, False)
-        else:
-            self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, True)
-
         self.transform_handles.update_positions()
         self._syncing = False
 
-    def sync_to_piece(self):
-        """Write current graphics state back to piece data."""
-        piece = self.piece
-        ds = piece.display_scale
-        img = piece.get_cropped_image()
-        h, w = img.shape[:2]
-        dcx = (w * ds) / 2.0
-        dcy = (h * ds) / 2.0
-
-        pos = self.pos()
-        # Scene position of center = pos + origin (regardless of rotation/scale)
-        piece.x = pos.x() + dcx
-        piece.y = pos.y() + dcy
-        piece.rotation_deg = self.rotation()
-        piece.scale = self.scale() * ds
-
     def itemChange(self, change, value):
-        if change == QGraphicsItem.GraphicsItemChange.ItemPositionHasChanged and not self._syncing:
-            self.sync_to_piece()
         if change == QGraphicsItem.GraphicsItemChange.ItemSelectedHasChanged:
             is_sel = bool(value)
             self.transform_handles.set_visible(is_sel and not self.piece.is_locked)
@@ -256,31 +304,7 @@ class PuzzlePieceItem(QGraphicsPixmapItem):
                 self.scene_ref.piece_selection_changed(self.piece, is_sel)
         return super().itemChange(change, value)
 
-    def mousePressEvent(self, event):
-        if self.piece.is_locked:
-            event.ignore()
-            return
-        self._drag_start_x = self.piece.x
-        self._drag_start_y = self.piece.y
-        super().mousePressEvent(event)
-
-    def mouseReleaseEvent(self, event):
-        if self.piece.is_locked:
-            event.ignore()
-            return
-        super().mouseReleaseEvent(event)
-        self.sync_to_piece()
-        if hasattr(self, '_drag_start_x'):
-            p = self.piece
-            if p.x != self._drag_start_x or p.y != self._drag_start_y:
-                self._push_transform_command(
-                    self._drag_start_x, self._drag_start_y,
-                    p.rotation_deg, p.scale, "Move",
-                )
-        if self.scene_ref and hasattr(self.scene_ref, 'piece_moved_signal'):
-            self.scene_ref.piece_moved_signal.emit()
-
-    def _push_transform_command(self, old_x, old_y, old_rot, old_scale, desc):
+    def push_transform_command(self, old_x, old_y, old_rot, old_scale, desc):
         if not self.scene_ref or not hasattr(self.scene_ref, 'undo_stack'):
             return
         undo_stack = self.scene_ref.undo_stack
@@ -386,6 +410,9 @@ class PuzzleScene(QGraphicsScene):
 
 
 class PuzzleView(QGraphicsView):
+    select_next = Signal()
+    select_prev = Signal()
+
     def __init__(self, scene):
         super().__init__(scene)
         self.setRenderHint(QPainter.RenderHint.Antialiasing, True)
@@ -393,10 +420,69 @@ class PuzzleView(QGraphicsView):
         self.setDragMode(QGraphicsView.DragMode.NoDrag)
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
         self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        self.setMouseTracking(True)
         self._panning = False
         self._pan_start = None
         self._space_held = False
         self._zoom = 1.0
+        # Drag state for move/rotate
+        self._drag_mode = None  # 'move' or 'rotate'
+        self._drag_start_scene = None
+        self._drag_start_x = 0.0
+        self._drag_start_y = 0.0
+        self._drag_start_rot = 0.0
+        self._drag_start_scale = 1.0
+        self._drag_piece_item = None
+
+    def _get_selected_item(self):
+        scene = self.scene()
+        if not isinstance(scene, PuzzleScene):
+            return None
+        piece = scene.get_selected_piece()
+        if piece and not piece.is_locked:
+            return scene.piece_items.get(piece)
+        return None
+
+    def _hit_test_piece(self, view_pos):
+        """Return 'inside' if view_pos is over the selected piece, else 'outside'."""
+        item = self._get_selected_item()
+        if item is None:
+            return None
+        scene_pos = self.mapToScene(view_pos)
+        item_pos = item.mapFromScene(scene_pos)
+        if item.boundingRect().contains(item_pos):
+            return 'inside'
+        return 'outside'
+
+    def _update_hover_cursor(self, view_pos):
+        if self._space_held:
+            return
+        # Check if hovering over a handle
+        item_under = self.itemAt(view_pos)
+        if isinstance(item_under, HandleItem):
+            if item_under.handle_type == HandleItem.ROTATE:
+                self.setCursor(_get_rotate_cursor())
+            else:
+                piece_item = item_under.parentItem()
+                self.setCursor(_resize_cursor_for_handle(item_under, piece_item))
+            return
+        hit = self._hit_test_piece(view_pos)
+        if hit == 'inside':
+            self.setCursor(QCursor(Qt.CursorShape.SizeAllCursor))
+        elif hit == 'outside':
+            self.setCursor(_get_rotate_cursor())
+        else:
+            self.setCursor(QCursor(Qt.CursorShape.ArrowCursor))
+
+    def event(self, ev):
+        if ev.type() == QEvent.Type.KeyPress:
+            if ev.key() == Qt.Key.Key_Tab:
+                self.select_next.emit()
+                return True
+            if ev.key() == Qt.Key.Key_Backtab:
+                self.select_prev.emit()
+                return True
+        return super().event(ev)
 
     def wheelEvent(self, event):
         delta = event.angleDelta().y()
@@ -426,8 +512,36 @@ class PuzzleView(QGraphicsView):
             self._pan_start = event.pos()
             self.setCursor(QCursor(Qt.CursorShape.ClosedHandCursor))
             event.accept()
-        else:
+            return
+
+        # Let handles handle themselves
+        item_under = self.itemAt(event.pos())
+        if isinstance(item_under, HandleItem):
             super().mousePressEvent(event)
+            return
+
+        if event.button() == Qt.MouseButton.LeftButton:
+            item = self._get_selected_item()
+            if item is not None:
+                scene_pos = self.mapToScene(event.pos())
+                hit = self._hit_test_piece(event.pos())
+                piece = item.piece
+                self._drag_piece_item = item
+                self._drag_start_scene = scene_pos
+                self._drag_start_x = piece.x
+                self._drag_start_y = piece.y
+                self._drag_start_rot = piece.rotation_deg
+                self._drag_start_scale = piece.scale
+                if hit == 'inside':
+                    self._drag_mode = 'move'
+                    self.setCursor(QCursor(Qt.CursorShape.SizeAllCursor))
+                else:
+                    self._drag_mode = 'rotate'
+                    self.setCursor(_get_rotate_cursor())
+                event.accept()
+                return
+
+        super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
         if self._panning and self._pan_start is not None:
@@ -440,8 +554,36 @@ class PuzzleView(QGraphicsView):
                 self.verticalScrollBar().value() - delta.y()
             )
             event.accept()
-        else:
-            super().mouseMoveEvent(event)
+            return
+
+        if self._drag_mode and self._drag_piece_item:
+            scene_pos = self.mapToScene(event.pos())
+            piece = self._drag_piece_item.piece
+
+            if self._drag_mode == 'move':
+                dx = scene_pos.x() - self._drag_start_scene.x()
+                dy = scene_pos.y() - self._drag_start_scene.y()
+                piece.x = self._drag_start_x + dx
+                piece.y = self._drag_start_y + dy
+                self._drag_piece_item.sync_from_piece()
+            elif self._drag_mode == 'rotate':
+                cx, cy = piece.x, piece.y
+                start_angle = math.degrees(math.atan2(
+                    self._drag_start_scene.y() - cy,
+                    self._drag_start_scene.x() - cx,
+                ))
+                current_angle = math.degrees(math.atan2(
+                    scene_pos.y() - cy,
+                    scene_pos.x() - cx,
+                ))
+                piece.rotation_deg = self._drag_start_rot + (current_angle - start_angle)
+                self._drag_piece_item.sync_from_piece()
+            event.accept()
+            return
+
+        # Hover cursor update
+        self._update_hover_cursor(event.pos())
+        super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
         if self._panning:
@@ -449,10 +591,33 @@ class PuzzleView(QGraphicsView):
             if self._space_held:
                 self.setCursor(QCursor(Qt.CursorShape.OpenHandCursor))
             else:
-                self.setCursor(QCursor(Qt.CursorShape.ArrowCursor))
+                self._update_hover_cursor(event.pos())
             event.accept()
-        else:
-            super().mouseReleaseEvent(event)
+            return
+
+        if self._drag_mode and self._drag_piece_item:
+            piece = self._drag_piece_item.piece
+            changed = (piece.x != self._drag_start_x or
+                       piece.y != self._drag_start_y or
+                       piece.rotation_deg != self._drag_start_rot or
+                       piece.scale != self._drag_start_scale)
+            if changed:
+                desc = "Move" if self._drag_mode == 'move' else "Rotate"
+                self._drag_piece_item.push_transform_command(
+                    self._drag_start_x, self._drag_start_y,
+                    self._drag_start_rot, self._drag_start_scale, desc,
+                )
+            scene = self.scene()
+            if hasattr(scene, 'piece_moved_signal'):
+                scene.piece_moved_signal.emit()
+            self._drag_mode = None
+            self._drag_piece_item = None
+            self._update_hover_cursor(event.pos())
+            event.accept()
+            return
+
+        super().mouseReleaseEvent(event)
+        self._update_hover_cursor(event.pos())
 
     def fit_all(self):
         rect = self.scene().itemsBoundingRect()
