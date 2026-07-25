@@ -1,65 +1,80 @@
 # Puzzle-Joiner
 
-Single-file (~2600 lines) Python/Qt desktop app for assembling puzzle pieces from scanned PDFs or images. Lives entirely in `puzzle-joiner`.
+Python/Qt desktop app for assembling puzzle pieces from scanned PDFs or images. Split into a `puzzle_joiner/` package, launched via `./puzzle-joiner` (uv script).
 
 ## Tech Stack
 
-- **Python 3.11+**, packaged with `uv` (inline script dependencies)
+- **Python 3.11+**, packaged with `uv` (inline script dependencies in `puzzle-joiner`)
 - **PySide6** (Qt6) for UI
 - **OpenCV** for image processing and feature matching
 - **NumPy**, **tifffile** for array manipulation and TIFF export
 - **Poppler** (`pdfseparate`, `pdftocairo`, `pdfinfo`) and **ImageMagick** (`convert`) for PDF handling
 
-## Architecture (top to bottom in the file)
+## File Structure
 
-### Data Model (~line 51)
+```
+puzzle-joiner              # Entry script (uv shebang, deps, thin launcher)
+puzzle_joiner/
+  __init__.py              # Empty
+  __main__.py              # main() entry point (also supports python -m puzzle_joiner)
+  priority.py              # LOW_PRIO prefix, _set_low_priority() for nice/ionice/chrt
+  model.py                 # PuzzlePiece data model
+  preprocessing.py         # PDF split, border crop, legend removal, auto-crop computation
+  cache.py                 # Page cache (~/.cache/puzzle-joiner/{md5}/)
+  matching.py              # ORB features, pairwise matching, auto-detect, snap
+  export.py                # Layered + flattened TIFF export
+  worker.py                # WorkerSignals, Worker (QRunnable pattern)
+  widgets.py               # All Qt widgets (handles, piece items, scene, view, thumbnails, dialogs)
+  main_window.py           # MainWindow (toolbar, import flow, action handlers)
+```
 
-`PuzzlePiece` — holds a piece's full-res BGRA image, a display pixmap (max 2048px), a thumbnail (256px), and transform state (`x, y, rotation_deg, scale, crop_rect`). Key methods: `get_affine_matrix()` for the piece-local-to-world 2x3 matrix, `get_bounding_box()` for world-space bounds, `get_cropped_image()` for applying the crop rect.
+## Module Responsibilities
 
-### PDF Import & Preprocessing (~line 132)
+### `model.py`
+`PuzzlePiece` — holds full-res BGRA image, display pixmap (max 2048px), thumbnail (256px), and transform state (`x, y, rotation_deg, scale, crop_rect`). Key methods: `get_affine_matrix()`, `get_bounding_box()`, `get_cropped_image()`.
 
-Pipeline: `pdfseparate` splits PDF into pages -> ImageMagick converts to PNG at 300 DPI -> border line detection via Hough transform (`autocrop_border_lines`) -> legend/margin removal (`remove_legend`, `find_tall_verticals`, `find_legend_column`, `find_corner_boxes`) -> auto-crop whitespace. Results cached under `~/.cache/puzzle-joiner/{md5}/page_XXXX.png`.
+### `preprocessing.py`
+Pipeline: `pdfseparate` → ImageMagick convert at 300 DPI → border line detection via Hough transform (`autocrop_border_lines`) → legend/margin removal (`remove_legend`) → auto-crop computation (`compute_auto_crop_rect`). Also contains `_convert_and_process_page` worker for ProcessPoolExecutor. Imports `LOW_PRIO` from `priority`.
 
-### Feature Matching (~line 560)
+### `cache.py`
+Persistent cache at `~/.cache/puzzle-joiner/{md5}/`. Stores uncropped page PNGs (`page_XXXX.png`) and auto-crop rects (`page_XXXX_autocrop.json`). `_load_cached_page` reads or recomputes crop rect on load. Imports `compute_auto_crop_rect` from `preprocessing`.
 
-- **ORB feature extraction** (`compute_orb_features`): extracts keypoints per color channel (B, G, R), masks out gray pixels (background). Uses WTA_K=4.
-- **Pairwise matching** (`estimate_pairwise_transform`): BFMatcher with cross-check -> top 150 matches -> `cv2.estimateAffinePartial2D()`. Validates via overlap percentage and `matching_pixels_pct` (pixel-level verification within tolerance).
-- **Auto-detect** (`auto_detect_placements`, ~line 711): greedy BFS starting from piece 0 at the origin. Iteratively matches unplaced pieces against placed ones (5-90% overlap, >75% pixel match). Unmatched pieces placed in a row below.
-- **Snap** (`snap_piece_to_neighbors`, ~line 953): refines existing placement using 50k ORB features on the geometric overlap ROI between a piece and its neighbors.
+### `matching.py`
+- **ORB extraction** (`compute_orb_features`): per-channel (B,G,R), optional gray masking, WTA_K=4.
+- **Pairwise matching** (`estimate_pairwise_transform`): BFMatcher cross-check → `estimateAffinePartial2D`. Pixel-level validation.
+- **Auto-detect** (`auto_detect_placements`): greedy BFS placement, >75% pixel match threshold.
+- **Snap** (`snap_piece_to_neighbors`): 50k features, no gray masking, ROI-based overlap matching, ≥50% pixel threshold.
 
-### Export (~line 987)
+### `export.py`
+- **Layered TIFF**: each piece as a separate BigTIFF layer (deflate, 1024x1024 tiles).
+- **Flattened TIFF**: alpha-composite all pieces onto single canvas.
 
-- **Layered TIFF**: each piece warped to world coords as a separate TIFF layer (BigTIFF, deflate).
-- **Flattened TIFF**: alpha-composite all pieces onto a single canvas.
+### `widgets.py`
+- `HandleItem`, `TransformHandles`: GIMP-style resize/rotate handles.
+- `PuzzlePieceItem`: syncs between model and scene, red border when selected.
+- `PuzzleScene`, `PuzzleView`: virtual canvas with zoom/pan.
+- `ThumbnailPanel`: horizontal strip with lock/matched indicators.
+- `PdfImportDialog`: page selection grid with async thumbnail generation.
+- `CutToolDialog`: crop region editor showing full uncropped image.
 
-### Threading (~line 1067)
+### `main_window.py`
+Toolbar workflow: Open PDF/Images → Auto-Detect → Snap → Cut → Lock → Export. Manages piece list, threading, progress dialogs.
 
-`Worker(QRunnable)` + `WorkerSignals` pattern. Long tasks (PDF conversion, auto-detect, snap) run on QThreadPool with progress signals. PDF conversion uses `ProcessPoolExecutor`; image loading uses `ThreadPoolExecutor`.
-
-### UI Components (~line 1097)
-
-- **TransformHandles / HandleItem**: 13 draggable handles (8 corners, 4 edges, 1 rotation) for manual piece manipulation.
-- **PuzzlePieceItem** (`QGraphicsPixmapItem`): syncs between model and scene. Red border when selected.
-- **PuzzleScene**: maps `PuzzlePiece` -> `PuzzlePieceItem`, finds neighbors within margin for snapping.
-- **PuzzleView**: mouse-wheel zoom, middle-click/space pan, fit-all.
-- **ThumbnailPanel** (~line 1482): horizontal strip of piece thumbnails with lock/matched indicators and context menus.
-- **PdfImportDialog** (~line 1810): page selection grid with async thumbnail generation.
-- **CutToolDialog** (~line 2091): crop region editor.
-
-### MainWindow (~line 2101)
-
-Toolbar-driven workflow: Open PDF/Images -> Auto-Detect -> Snap (refine) -> Cut (crop) -> Lock -> Export. State is in-memory only (no save/load).
+### `priority.py`
+Builds `LOW_PRIO` prefix (`chrt --idle 0 nice -n19 ionice --class idle`) for subprocesses. `_set_low_priority()` for ProcessPoolExecutor worker initializer.
 
 ## Key Data Flow
 
 ```
-PDF/Images -> convert & clean (parallel) -> cache -> PuzzlePiece list
-  -> Auto-Detect (ORB matching, BFS placement) -> scene positions
-  -> Manual adjust / Snap / Cut -> Export TIFF
+PDF/Images → convert & clean (parallel, low-prio) → cache → PuzzlePiece list
+  → Auto-Detect (ORB matching, BFS placement) → scene positions
+  → Manual adjust / Snap / Cut → Export TIFF
 ```
 
 ## Running
 
 ```
 uv run puzzle-joiner
+# or
+python -m puzzle_joiner
 ```
