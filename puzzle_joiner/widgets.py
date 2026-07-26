@@ -402,6 +402,7 @@ class PuzzleScene(QGraphicsScene):
         super().__init__()
         self.piece_items: dict = {}  # PuzzlePiece -> PuzzlePieceItem
         self.snap_pairs: list = []   # list of (PuzzlePiece, PuzzlePiece) tuples
+        self.snap_transforms: dict = {}  # frozenset({a,b}) -> (tx,ty,rot,scale)
         self.undo_stack = undo_stack
         self.editing_enabled = True
         self.setSceneRect(-50000, -50000, 100000, 100000)
@@ -419,6 +420,9 @@ class PuzzleScene(QGraphicsScene):
             self.removeItem(item)
             self.snap_pairs = [(a, b) for a, b in self.snap_pairs
                                if a is not piece and b is not piece]
+            pid = id(piece)
+            self.snap_transforms = {k: v for k, v in self.snap_transforms.items()
+                                    if pid not in k}
             self.update_scene_rect()
 
     def update_scene_rect(self):
@@ -454,13 +458,47 @@ class PuzzleScene(QGraphicsScene):
         """Record that pieces a and b are snapped together."""
         for pa, pb in self.snap_pairs:
             if (pa is a and pb is b) or (pa is b and pb is a):
+                self.record_snap_transform(a, b)
                 return  # already exists
         self.snap_pairs.append((a, b))
+        self.record_snap_transform(a, b)
 
     def remove_snap_pair(self, a: PuzzlePiece, b: PuzzlePiece):
         """Remove a snap pair."""
         self.snap_pairs = [(pa, pb) for pa, pb in self.snap_pairs
                            if not ((pa is a and pb is b) or (pa is b and pb is a))]
+        self.snap_transforms.pop(frozenset((id(a), id(b))), None)
+
+    @staticmethod
+    def _relative_transform(a: PuzzlePiece, b: PuzzlePiece):
+        """Compute M_A^{-1} * M_B decomposed as (tx, ty, rot_deg, scale)."""
+        ma = np.vstack([a.get_affine_matrix(), [0, 0, 1]])
+        mb = np.vstack([b.get_affine_matrix(), [0, 0, 1]])
+        rel = np.linalg.inv(ma) @ mb
+        s = math.sqrt(rel[0, 0] ** 2 + rel[1, 0] ** 2)
+        r = math.degrees(math.atan2(rel[1, 0], rel[0, 0]))
+        return rel[0, 2], rel[1, 2], r, s
+
+    def record_snap_transform(self, a: PuzzlePiece, b: PuzzlePiece):
+        """Store the current relative transform for a snap pair."""
+        self.snap_transforms[frozenset((id(a), id(b)))] = self._relative_transform(a, b)
+
+    def is_snap_valid(self, a: PuzzlePiece, b: PuzzlePiece) -> bool:
+        """Check if a snap pair's relative transform is still valid."""
+        key = frozenset((id(a), id(b)))
+        stored = self.snap_transforms.get(key)
+        if stored is None:
+            return False
+        tx0, ty0, r0, s0 = stored
+        tx1, ty1, r1, s1 = self._relative_transform(a, b)
+        if abs(tx1 - tx0) > 1.0 or abs(ty1 - ty0) > 1.0:
+            return False
+        dr = (r1 - r0 + 180) % 360 - 180
+        if abs(dr) > 0.05:
+            return False
+        if abs(s1 - s0) > 0.001:
+            return False
+        return True
 
     def has_snap_partners(self, piece: PuzzlePiece, locked_only=False) -> bool:
         """Return True if piece is in any snap pair.

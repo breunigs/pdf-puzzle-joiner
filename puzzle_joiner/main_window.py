@@ -406,13 +406,24 @@ class MainWindow(QMainWindow):
 
         def task(progress):
             progress.emit(10, "Computing features...")
-            matched, best_nb = snap_piece_to_neighbors(piece, neighbors)
-            if not matched:
+
+            # Filter out neighbors whose snap is already valid
+            need_snap = [n for n in neighbors
+                         if not self.scene.is_snap_valid(piece, n)]
+            if not need_snap:
+                progress.emit(90, "All snaps still valid.")
+                return "valid"
+
+            matched, best_nb = snap_piece_to_neighbors(piece, need_snap)
+            # Include already-valid neighbors in the matched set
+            already_valid = [n for n in neighbors if n not in need_snap]
+            all_matched = matched + already_valid
+            if not all_matched:
                 return None
 
             ox, oy, orot, oscale = before[piece][:4]
             # Results: list of (piece, snap_pair_neighbors)
-            all_results = [(piece, matched)]
+            all_results = [(piece, all_matched)]
 
             # BFS through overlap chain — anchor (best match) stays fixed
             processed = {piece}
@@ -443,7 +454,6 @@ class MainWindow(QMainWindow):
                 cur_oscale = current.scale
 
                 # Find current's neighbors BEFORE applying rigid delta
-                # (they share bounding boxes at original positions)
                 cur_neighbors = self.scene.get_neighbors(current)
 
                 # Apply rigid delta from reference piece's movement
@@ -459,12 +469,15 @@ class MainWindow(QMainWindow):
                 current.rotation_deg += rot_delta
                 current.scale *= scale_ratio
 
-                # Try to snap current to anchor (feature match refinement)
-                snap_matched, _ = snap_piece_to_neighbors(current, [anchor])
-                if snap_matched:
-                    all_results.append((current, snap_matched))
+                # Skip ORB computation if snap to anchor is still valid
+                if self.scene.is_snap_valid(current, anchor):
+                    all_results.append((current, [anchor]))
                 else:
-                    all_results.append((current, []))
+                    snap_matched, _ = snap_piece_to_neighbors(current, [anchor])
+                    if snap_matched:
+                        all_results.append((current, snap_matched))
+                    else:
+                        all_results.append((current, []))
 
                 # Enqueue current's overlapping neighbors
                 for n in cur_neighbors:
@@ -479,6 +492,10 @@ class MainWindow(QMainWindow):
             return all_results
 
         def on_done(results):
+            if results == "valid":
+                self.status_bar.showMessage("Already snapped — no changes needed.")
+                self._update_snap_enabled()
+                return
             if results is None:
                 self.status_bar.showMessage("Snap found no match.")
                 self._update_snap_enabled()
@@ -521,10 +538,15 @@ class MainWindow(QMainWindow):
                 progress.emit(int(90 * i / max(total, 1)), f"Snapping piece {i+1}/{total}...")
                 neighbors = self.scene.get_neighbors(piece)
                 if neighbors:
-                    matched, _ = snap_piece_to_neighbors(piece, neighbors)
+                    need_snap = [n for n in neighbors
+                                 if not self.scene.is_snap_valid(piece, n)]
+                    if not need_snap:
+                        continue
+                    matched, _ = snap_piece_to_neighbors(piece, need_snap)
                     if matched:
+                        already_valid = [n for n in neighbors if n not in need_snap]
                         piece.is_matched = True
-                        results.append((piece, matched))
+                        results.append((piece, matched + already_valid))
             return results
 
         def on_done(results):
