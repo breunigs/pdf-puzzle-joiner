@@ -91,11 +91,12 @@ python -m puzzle_joiner
 
 ## Checking & Testing
 
-Run `make check` to verify syntax, unit tests, and boot test. Do this instead of manually checking syntax.
+Run `make check` to verify syntax, lint, unit tests, and boot test. Do this instead of manually checking syntax.
 
 ```
-make check          # all checks: syntax + test + boot
+make check          # all checks: syntax + lint + test + boot
 make syntax         # Python AST parse of all .py files
+make lint           # pyflakes undefined-name check
 make test           # unit tests (pytest, no display needed)
 make boot           # smoke test: MainWindow constructs (offscreen Qt)
 ```
