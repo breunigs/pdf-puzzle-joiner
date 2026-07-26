@@ -793,11 +793,10 @@ class MainWindow(QMainWindow):
             return
         cx = sum(p.x for p in self.pieces) / len(self.pieces)
         cy = sum(p.y for p in self.pieces) / len(self.pieces)
-        if abs(cx) < 1 and abs(cy) < 1:
-            return
-        for p in self.pieces:
-            p.x -= cx
-            p.y -= cy
+        if abs(cx) >= 1 or abs(cy) >= 1:
+            for p in self.pieces:
+                p.x -= cx
+                p.y -= cy
         self.scene.sync_all_from_pieces()
 
     def _auto_save_layout(self):

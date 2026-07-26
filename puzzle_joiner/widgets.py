@@ -274,8 +274,7 @@ class TransformHandles:
 
     def update_positions(self):
         piece = self.piece_item.piece
-        img = piece.get_cropped_image()
-        h, w = img.shape[:2]
+        w, h = piece._cropped_size()
         ds = piece.display_scale
         dw, dh = w * ds, h * ds  # display-pixmap dimensions
 
@@ -311,8 +310,7 @@ class PuzzlePieceItem(QGraphicsPixmapItem):
         self._syncing = False
 
         self.setFlags(
-            QGraphicsItem.GraphicsItemFlag.ItemIsSelectable |
-            QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges
+            QGraphicsItem.GraphicsItemFlag.ItemIsSelectable
         )
         # Selection is managed via thumbnail panel, not canvas clicks
         self.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
@@ -342,7 +340,8 @@ class PuzzlePieceItem(QGraphicsPixmapItem):
         self.setScale(piece.scale / piece.display_scale)
 
         self.setTransformOriginPoint(dcx, dcy)
-        self.transform_handles.update_positions()
+        if self.transform_handles.handles[0].isVisible():
+            self.transform_handles.update_positions()
         self._syncing = False
 
     def itemChange(self, change, value):
