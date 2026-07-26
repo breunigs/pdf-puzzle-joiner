@@ -41,6 +41,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Puzzle Joiner")
         self.resize(1400, 900)
         self.pieces: list = []
+        self._input_path: Optional[str] = None
         self._work_dir = None
         self._layout_dir: Optional[str] = None
         self._thread_pool = QThreadPool.globalInstance()
@@ -222,6 +223,8 @@ class MainWindow(QMainWindow):
             return
 
         pages = dlg.get_pages()
+        if not self._input_path:
+            self._input_path = pdf_path
         self._import_pdf(pdf_path, pages)
 
     def _import_pdf(self, pdf_path: str, pages):
@@ -318,6 +321,8 @@ class MainWindow(QMainWindow):
         )
         if not paths:
             return
+        if not self._input_path:
+            self._input_path = paths[0]
         self._import_images(paths)
 
     def _import_images(self, paths: list):
@@ -640,8 +645,10 @@ class MainWindow(QMainWindow):
     def on_export(self):
         if not self.pieces:
             return
+        src = self._input_path or self.pieces[0].source_path
+        default_name = os.path.splitext(src)[0] + ".tif"
         path, _ = QFileDialog.getSaveFileName(
-            self, "Export TIFF", "puzzle.tif", "TIFF (*.tif *.tiff)"
+            self, "Export TIFF", default_name, "TIFF (*.tif *.tiff)"
         )
         if not path:
             return

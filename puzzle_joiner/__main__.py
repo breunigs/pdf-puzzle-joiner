@@ -1,4 +1,5 @@
 import logging
+import os
 import shutil
 import sys
 
@@ -57,8 +58,9 @@ def main():
     window.show()
 
     # If files passed on command line, load them
-    args = sys.argv[1:]
+    args = [os.path.abspath(a) for a in sys.argv[1:]]
     if args:
+        window._input_path = args[0]
         # Check if PDF
         if len(args) == 1 and args[0].lower().endswith(".pdf"):
             QTimer.singleShot(100, lambda: window._import_pdf(args[0], None))
