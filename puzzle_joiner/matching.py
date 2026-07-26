@@ -293,7 +293,7 @@ def auto_detect_placements(pieces: list):
 
 
 def _piece_label(piece: "PuzzlePiece") -> str:
-    name = os.path.basename(piece.source_path) if piece.source_path else "?"
+    name = piece.display_name or os.path.basename(piece.source_path) or "?"
     return f"#{piece.layer_index} ({name})"
 
 

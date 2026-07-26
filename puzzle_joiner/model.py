@@ -11,6 +11,8 @@ from PySide6.QtGui import QPixmap, QImage
 class PuzzlePiece:
     def __init__(self):
         self.source_path: str = ""
+        self.source_file: str = ""   # original input file (PDF or image)
+        self.display_name: str = ""
         self.image: np.ndarray = None          # Full-res BGRA
         self.thumbnail: QPixmap = None         # 256px preview
         self.display_pixmap: QPixmap = None    # Reduced-res for canvas

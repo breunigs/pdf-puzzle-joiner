@@ -1,5 +1,6 @@
 import math
 import os
+import re
 import sys
 import tempfile
 import concurrent.futures
@@ -42,6 +43,7 @@ class MainWindow(QMainWindow):
         self.resize(1400, 900)
         self.pieces: list = []
         self._input_path: Optional[str] = None
+        self._source_files: list = []  # original filenames for display_name logic
         self._work_dir = None
         self._layout_dir: Optional[str] = None
         self._thread_pool = QThreadPool.globalInstance()
@@ -311,16 +313,30 @@ class MainWindow(QMainWindow):
             # Sort by page index (idx is last element)
             results.sort(key=lambda r: r[-1])
             progress.emit(98, "Done.")
-            return results
+            return (results, requested)
 
         def on_done(result):
             if result is None:
                 return
-            for (path, bgra, crop_rect, idx) in result:
-                self._add_piece_from_array(bgra, path, idx, crop_rect=crop_rect)
+            results, requested = result
+            pdf_stem = os.path.splitext(os.path.basename(pdf_path))[0]
+            was_single = len(self._source_files) == 1
+            self._source_files.append(pdf_path)
+            multi = len(self._source_files) > 1
+            # When going from 1→2 source files, add filename prefix to existing pieces
+            if was_single and multi:
+                self._add_filename_prefix_to_display_names()
+            for (path, bgra, crop_rect, idx) in results:
+                page_num = requested[idx]
+                if multi:
+                    dname = f"{pdf_stem} P{page_num}"
+                else:
+                    dname = f"Page {page_num}"
+                self._add_piece_from_array(bgra, path, idx, crop_rect=crop_rect,
+                                           display_name=dname, source_file=pdf_path)
             self._layout_dir = cache_dir
             had_layout = self._restore_layout()
-            n = len(result)
+            n = len(results)
             name = os.path.basename(pdf_path)
             self.status_bar.showMessage(f"Loaded {n} pages from {name}")
             self.view.fit_all()
@@ -363,8 +379,13 @@ class MainWindow(QMainWindow):
         def on_done(result):
             if not result:
                 return
+            was_single = len(self._source_files) == 1
             for (path, bgra, idx) in result:
-                self._add_piece_from_array(bgra, path, idx)
+                if path not in self._source_files:
+                    self._source_files.append(path)
+                self._add_piece_from_array(bgra, path, idx, source_file=path)
+            if was_single and len(self._source_files) > 1:
+                self._add_filename_prefix_to_display_names()
             self._layout_dir = _images_cache_dir(paths)
             had_layout = self._restore_layout()
             self.status_bar.showMessage(f"Loaded {len(result)} images")
@@ -375,9 +396,12 @@ class MainWindow(QMainWindow):
         self._run_with_progress("Loading images", task, on_done=on_done)
 
     def _add_piece_from_array(self, bgra: np.ndarray, source_path: str, idx: int,
-                              crop_rect: tuple = None):
+                              crop_rect: tuple = None, display_name: str = "",
+                              source_file: str = ""):
         piece = PuzzlePiece()
         piece.source_path = source_path
+        piece.source_file = source_file or source_path
+        piece.display_name = display_name or os.path.basename(source_path)
         piece.image = bgra
         piece.layer_index = idx
         piece.crop_rect = crop_rect
@@ -391,6 +415,15 @@ class MainWindow(QMainWindow):
         self.pieces.append(piece)
         self.scene.add_piece(piece)
         self.thumbnail_panel.add_piece(piece)
+
+    def _add_filename_prefix_to_display_names(self):
+        """Prepend filename stem to existing pieces when a second source file is added."""
+        for piece in self.pieces:
+            stem = os.path.splitext(os.path.basename(piece.source_file))[0]
+            m = re.match(r"^Page (\d+)$", piece.display_name)
+            if m:
+                piece.display_name = f"{stem} P{m.group(1)}"
+        self.thumbnail_panel.update_all()
 
     # --- Auto-detect ---
 

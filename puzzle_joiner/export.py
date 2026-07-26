@@ -1,6 +1,5 @@
 import math
 import os
-import re
 
 import cv2
 import numpy as np
@@ -10,12 +9,8 @@ from .model import PuzzlePiece
 
 
 def _layer_name(piece: PuzzlePiece) -> str:
-    """Derive a human-readable layer name from source_path."""
-    name = os.path.basename(piece.source_path)
-    m = re.match(r"page_0*(\d+)\.\w+$", name)
-    if m:
-        return f"Page {m.group(1)}"
-    return name
+    """Derive a human-readable layer name."""
+    return piece.display_name or os.path.basename(piece.source_path)
 
 
 def export_layered_tiff(pieces: list, output_path: str):
