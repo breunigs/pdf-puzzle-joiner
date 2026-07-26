@@ -1,3 +1,4 @@
+import logging
 import shutil
 import sys
 
@@ -37,6 +38,11 @@ def _check_external_dependencies():
 
 
 def main():
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format="%(asctime)s.%(msecs)03d %(name)s %(message)s",
+        datefmt="%H:%M:%S",
+    )
     cleanup_old_cache_entries()
     app = QApplication(sys.argv)
     app.setApplicationName("Puzzle Joiner")

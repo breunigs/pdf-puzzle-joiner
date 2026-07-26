@@ -30,10 +30,15 @@ class PuzzlePiece:
             return self.image[cy:cy+ch, cx:cx+cw].copy()
         return self.image
 
+    def _cropped_size(self):
+        """Return (w, h) of the cropped image without copying pixel data."""
+        if self.crop_rect is not None:
+            return self.crop_rect[2], self.crop_rect[3]
+        return self.image.shape[1], self.image.shape[0]
+
     def get_affine_matrix(self) -> np.ndarray:
         """2x3 affine matrix mapping piece-local coords to world coords."""
-        img = self.get_cropped_image()
-        h, w = img.shape[:2]
+        w, h = self._cropped_size()
         cx, cy = w / 2.0, h / 2.0
         cos_a = math.cos(math.radians(self.rotation_deg))
         sin_a = math.sin(math.radians(self.rotation_deg))
@@ -47,8 +52,7 @@ class PuzzlePiece:
         return np.array([[a, b, tx], [c, d, ty]], dtype=np.float64)
 
     def get_bounding_box(self) -> QRectF:
-        img = self.get_cropped_image()
-        h, w = img.shape[:2]
+        w, h = self._cropped_size()
         corners = np.array([[0, 0], [w, 0], [w, h], [0, h]], dtype=np.float32).reshape(-1, 1, 2)
         M = self.get_affine_matrix()
         transformed = cv2.transform(corners, M).reshape(-1, 2)

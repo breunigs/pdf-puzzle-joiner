@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import logging
 import math
+import os
+import time
 
 import cv2
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 
 def compute_orb_features(image: np.ndarray, nfeatures=16000, mask=None, gray_masking=True):
@@ -287,6 +292,11 @@ def auto_detect_placements(pieces: list):
             row_x += w + 50
 
 
+def _piece_label(piece: "PuzzlePiece") -> str:
+    name = os.path.basename(piece.source_path) if piece.source_path else "?"
+    return f"#{piece.layer_index} ({name})"
+
+
 def snap_piece_to_neighbors(piece: "PuzzlePiece", neighbors: list):
     """
     Refine piece placement using ORB feature matching against neighbors.
@@ -294,6 +304,10 @@ def snap_piece_to_neighbors(piece: "PuzzlePiece", neighbors: list):
     Modifies piece.x, piece.y, piece.rotation_deg, piece.scale in-place.
     Returns True if snap succeeded.
     """
+    t0 = time.monotonic()
+    piece_lbl = _piece_label(piece)
+    logger.debug("snap %s: start, %d neighbors", piece_lbl, len(neighbors))
+
     piece_img = piece.get_cropped_image()
     ph, pw = piece_img.shape[:2]
 
@@ -301,30 +315,53 @@ def snap_piece_to_neighbors(piece: "PuzzlePiece", neighbors: list):
     best_pixel = 0.0
     matched_neighbors = []
 
+    # Pre-compute piece geometry (invariant across neighbors)
+    M_piece = piece.get_affine_matrix()
+    M_piece_inv = cv2.invertAffineTransform(M_piece)
+    piece_local = np.array(
+        [[0, 0], [pw, 0], [pw, ph], [0, ph]], dtype=np.float32
+    )
+    piece_world = cv2.transform(
+        piece_local.reshape(-1, 1, 2), M_piece
+    ).reshape(-1, 2)
+    p_min = piece_world.min(axis=0)
+    p_max = piece_world.max(axis=0)
+
     for neighbor in neighbors:
         if neighbor is piece:
             continue
+        nb_lbl = _piece_label(neighbor)
         neighbor_img = neighbor.get_cropped_image()
         nh, nw = neighbor_img.shape[:2]
 
-        # World bounding boxes
-        p_bb = piece.get_bounding_box()
-        n_bb = neighbor.get_bounding_box()
-
-        # Geometric overlap in world coords
-        inter = p_bb.intersected(n_bb)
-        if inter.isEmpty() or inter.width() < 10 or inter.height() < 10:
+        # Check actual polygon overlap (not just axis-aligned bounding boxes)
+        M_neighbor = neighbor.get_affine_matrix()
+        nb_local = np.array(
+            [[0, 0], [nw, 0], [nw, nh], [0, nh]], dtype=np.float32
+        )
+        nb_world = cv2.transform(
+            nb_local.reshape(-1, 1, 2), M_neighbor
+        ).reshape(-1, 2)
+        overlap_area, _ = cv2.intersectConvexConvex(piece_world, nb_world)
+        if overlap_area < 100:
+            logger.debug("snap %s: skip %s, no polygon overlap (%.0f px²)",
+                         piece_lbl, nb_lbl, overlap_area)
             continue
 
-        # Piece ROI: map inter from world to piece-local coords
-        M_piece = piece.get_affine_matrix()
-        M_piece_inv = cv2.invertAffineTransform(M_piece)
+        # Bounding box intersection for ROI extraction
+        n_min = nb_world.min(axis=0)
+        n_max = nb_world.max(axis=0)
+        ix1 = max(float(p_min[0]), float(n_min[0]))
+        iy1 = max(float(p_min[1]), float(n_min[1]))
+        ix2 = min(float(p_max[0]), float(n_max[0]))
+        iy2 = min(float(p_max[1]), float(n_max[1]))
+        if ix2 - ix1 < 10 or iy2 - iy1 < 10:
+            logger.debug("snap %s: skip %s, bbox intersection too small",
+                         piece_lbl, nb_lbl)
+            continue
 
         inter_corners = np.array([
-            [inter.left(), inter.top()],
-            [inter.right(), inter.top()],
-            [inter.right(), inter.bottom()],
-            [inter.left(), inter.bottom()],
+            [ix1, iy1], [ix2, iy1], [ix2, iy2], [ix1, iy2],
         ], dtype=np.float32).reshape(-1, 1, 2)
 
         piece_corners = cv2.transform(inter_corners, M_piece_inv).reshape(-1, 2)
@@ -337,7 +374,6 @@ def snap_piece_to_neighbors(piece: "PuzzlePiece", neighbors: list):
         piece_roi = piece_img[py1:py2, px1:px2]
 
         # Neighbor ROI
-        M_neighbor = neighbor.get_affine_matrix()
         M_neighbor_inv = cv2.invertAffineTransform(M_neighbor)
         neighbor_corners = cv2.transform(inter_corners, M_neighbor_inv).reshape(-1, 2)
         nx1 = max(0, int(np.min(neighbor_corners[:, 0])))
@@ -348,18 +384,36 @@ def snap_piece_to_neighbors(piece: "PuzzlePiece", neighbors: list):
             continue
         neighbor_roi = neighbor_img[ny1:ny2, nx1:nx2]
 
+        logger.debug("snap %s vs %s: ROIs piece=%dx%d neighbor=%dx%d, overlap=%.0f px²",
+                     piece_lbl, nb_lbl,
+                     px2 - px1, py2 - py1, nx2 - nx1, ny2 - ny1, overlap_area)
+
         # Use alpha channel as mask to only match in non-transparent regions
         piece_alpha = piece_roi[:, :, 3] if piece_roi.shape[2] == 4 else None
         neighbor_alpha = neighbor_roi[:, :, 3] if neighbor_roi.shape[2] == 4 else None
 
         # Compute features in overlap — no gray masking (matches stitch-images-realign)
-        kp_p, des_p = compute_orb_features(piece_roi, nfeatures=50000, gray_masking=False, mask=piece_alpha)
-        kp_n, des_n = compute_orb_features(neighbor_roi, nfeatures=50000, gray_masking=False, mask=neighbor_alpha)
+        # nfeatures is per-channel (×3 = total descriptors for BFMatcher)
+        t_orb = time.monotonic()
+        kp_p, des_p = compute_orb_features(piece_roi, nfeatures=5000, gray_masking=False, mask=piece_alpha)
+        t_orb_piece = time.monotonic() - t_orb
+        t_orb = time.monotonic()
+        kp_n, des_n = compute_orb_features(neighbor_roi, nfeatures=5000, gray_masking=False, mask=neighbor_alpha)
+        t_orb_nb = time.monotonic() - t_orb
+        logger.debug("snap %s vs %s: ORB piece %.2fs (%d kp), neighbor %.2fs (%d kp)",
+                     piece_lbl, nb_lbl,
+                     t_orb_piece, len(kp_p) if kp_p else 0,
+                     t_orb_nb, len(kp_n) if kp_n else 0)
         if des_p is None or des_n is None or len(kp_p) < 4 or len(kp_n) < 4:
+            logger.debug("snap %s vs %s: skip, too few features", piece_lbl, nb_lbl)
             continue
 
+        t_match = time.monotonic()
         bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
         matches = sorted(bf.match(des_p, des_n), key=lambda m: m.distance)[:200]
+        t_match = time.monotonic() - t_match
+        logger.debug("snap %s vs %s: BFMatcher %.2fs, %d matches",
+                     piece_lbl, nb_lbl, t_match, len(matches))
         if len(matches) < 4:
             continue
 
@@ -378,8 +432,7 @@ def snap_piece_to_neighbors(piece: "PuzzlePiece", neighbors: list):
         matrix_piece_to_neighbor_local[:, 2] = matrix_roi[:, 2] - corr_piece + neighbor_local_offset
 
         # Now convert to world coords:
-        M_nb = neighbor.get_affine_matrix()
-        M_nb_hom = np.vstack([M_nb, [0, 0, 1]])
+        M_nb_hom = np.vstack([M_neighbor, [0, 0, 1]])
         M_ptol_hom = np.vstack([matrix_piece_to_neighbor_local, [0, 0, 1]])
         M_new_world_hom = M_nb_hom @ M_ptol_hom
         M_new_world = M_new_world_hom[:2, :]
@@ -388,11 +441,14 @@ def snap_piece_to_neighbors(piece: "PuzzlePiece", neighbors: list):
         data_piece = {"image": piece_img, "w": pw, "h": ph}
         data_neighbor = {"image": neighbor_img, "w": nw, "h": nh}
         bbox_piece_in_neighbor = cv2.transform(
-            np.array([[0, 0], [pw, 0], [pw, ph], [0, ph]], dtype=np.float32).reshape(-1, 1, 2),
-            matrix_piece_to_neighbor_local
+            piece_local.reshape(-1, 1, 2), matrix_piece_to_neighbor_local
         ).reshape(-1, 2)
+        t_pix = time.monotonic()
         pct = matching_pixels_pct(data_neighbor, data_piece, matrix_piece_to_neighbor_local,
                                    bbox_piece_in_neighbor)
+        t_pix = time.monotonic() - t_pix
+        logger.debug("snap %s vs %s: pixel match %.1f%% (%.2fs)",
+                     piece_lbl, nb_lbl, pct, t_pix)
         if pct >= 0.5:
             matched_neighbors.append(neighbor)
         if pct > best_pixel:
@@ -400,15 +456,13 @@ def snap_piece_to_neighbors(piece: "PuzzlePiece", neighbors: list):
             best_matrix = M_new_world
 
     if best_matrix is None or best_pixel < 0.5:
+        logger.debug("snap %s: no match found (%.2fs total)",
+                     piece_lbl, time.monotonic() - t0)
         return []
 
     # Decompose new world matrix to update piece params
-    tx, ty, rot, sc = decompose_affine(best_matrix)
-    img = piece.get_cropped_image()
-    h, w = img.shape[:2]
-    # The matrix: world = M_new_world * local
     # center in world = M_new_world * [w/2, h/2]
-    cx_l, cy_l = w / 2.0, h / 2.0
+    cx_l, cy_l = pw / 2.0, ph / 2.0
     a, b = best_matrix[0, 0], best_matrix[0, 1]
     c2, d = best_matrix[1, 0], best_matrix[1, 1]
     tx2, ty2 = best_matrix[0, 2], best_matrix[1, 2]
@@ -416,4 +470,6 @@ def snap_piece_to_neighbors(piece: "PuzzlePiece", neighbors: list):
     piece.y = c2 * cx_l + d * cy_l + ty2
     piece.scale = math.sqrt(a * a + c2 * c2)
     piece.rotation_deg = math.degrees(math.atan2(c2, a))
+    logger.debug("snap %s: done, best=%.1f%%, %d matched neighbors (%.2fs total)",
+                 piece_lbl, best_pixel, len(matched_neighbors), time.monotonic() - t0)
     return matched_neighbors
