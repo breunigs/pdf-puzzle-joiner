@@ -127,7 +127,7 @@ def estimate_pairwise_transform(data1: dict, data2: dict):
     if des1 is None or des2 is None or len(kp1) < 4 or len(kp2) < 4:
         return None, (0.0, 0.0, 0.0), 0
 
-    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING2, crossCheck=True)
     matches = bf.match(des1, des2)
     sorted_matches = sorted(matches, key=lambda x: x.distance)
     top_matches = sorted_matches[:150]
@@ -349,57 +349,61 @@ def snap_piece_to_neighbors(piece: "PuzzlePiece", neighbors: list):
                          piece_lbl, nb_lbl, overlap_area)
             continue
 
-        # Bounding box intersection for ROI extraction
+        # Warp both pieces into an axis-aligned overlap frame so the ROIs
+        # contain only the actual overlap region (no bbox inflation from rotation).
         n_min = nb_world.min(axis=0)
         n_max = nb_world.max(axis=0)
         ix1 = max(float(p_min[0]), float(n_min[0]))
         iy1 = max(float(p_min[1]), float(n_min[1]))
         ix2 = min(float(p_max[0]), float(n_max[0]))
         iy2 = min(float(p_max[1]), float(n_max[1]))
-        if ix2 - ix1 < 10 or iy2 - iy1 < 10:
+        if ix2 - ix1 < 1 or iy2 - iy1 < 1:
             logger.debug("snap %s: skip %s, bbox intersection too small",
                          piece_lbl, nb_lbl)
             continue
 
-        inter_corners = np.array([
-            [ix1, iy1], [ix2, iy1], [ix2, iy2], [ix1, iy2],
-        ], dtype=np.float32).reshape(-1, 1, 2)
-
-        piece_corners = cv2.transform(inter_corners, M_piece_inv).reshape(-1, 2)
-        px1 = max(0, int(np.min(piece_corners[:, 0])))
-        py1 = max(0, int(np.min(piece_corners[:, 1])))
-        px2 = min(pw, int(np.max(piece_corners[:, 0])))
-        py2 = min(ph, int(np.max(piece_corners[:, 1])))
-        if px2 <= px1 or py2 <= py1:
+        # ROI pixel size at piece resolution
+        avg_scale = (piece.scale + neighbor.scale) / 2.0
+        px_per_world = 1.0 / avg_scale
+        roi_w = max(1, int(math.ceil((ix2 - ix1) * px_per_world)))
+        roi_h = max(1, int(math.ceil((iy2 - iy1) * px_per_world)))
+        if roi_w < 50 or roi_h < 50:
+            logger.debug("snap %s: skip %s, overlap ROI too small (%dx%d)",
+                         piece_lbl, nb_lbl, roi_w, roi_h)
             continue
-        piece_roi = piece_img[py1:py2, px1:px2]
 
-        # Neighbor ROI
-        M_neighbor_inv = cv2.invertAffineTransform(M_neighbor)
-        neighbor_corners = cv2.transform(inter_corners, M_neighbor_inv).reshape(-1, 2)
-        nx1 = max(0, int(np.min(neighbor_corners[:, 0])))
-        ny1 = max(0, int(np.min(neighbor_corners[:, 1])))
-        nx2 = min(nw, int(np.max(neighbor_corners[:, 0])))
-        ny2 = min(nh, int(np.max(neighbor_corners[:, 1])))
-        if nx2 <= nx1 or ny2 <= ny1:
-            continue
-        neighbor_roi = neighbor_img[ny1:ny2, nx1:nx2]
+        # World → overlap-ROI warp (removes rotation, normalises scale)
+        M_w2r = np.array([
+            [px_per_world, 0, -ix1 * px_per_world],
+            [0, px_per_world, -iy1 * px_per_world],
+        ], dtype=np.float64)
+        M_w2r_hom = np.vstack([M_w2r, [0, 0, 1]])
+        M_p2r = (M_w2r_hom @ np.vstack([M_piece, [0, 0, 1]]))[:2, :]
+        M_n2r = (M_w2r_hom @ np.vstack([M_neighbor, [0, 0, 1]]))[:2, :]
 
-        logger.debug("snap %s vs %s: ROIs piece=%dx%d neighbor=%dx%d, overlap=%.0f px²",
-                     piece_lbl, nb_lbl,
-                     px2 - px1, py2 - py1, nx2 - nx1, ny2 - ny1, overlap_area)
+        bv = (0, 0, 0, 0)
+        piece_warped = cv2.warpAffine(piece_img, M_p2r, (roi_w, roi_h),
+                                       flags=cv2.INTER_LINEAR,
+                                       borderMode=cv2.BORDER_CONSTANT, borderValue=bv)
+        nb_warped = cv2.warpAffine(neighbor_img, M_n2r, (roi_w, roi_h),
+                                    flags=cv2.INTER_LINEAR,
+                                    borderMode=cv2.BORDER_CONSTANT, borderValue=bv)
 
-        # Use alpha channel as mask to only match in non-transparent regions
-        piece_alpha = piece_roi[:, :, 3] if piece_roi.shape[2] == 4 else None
-        neighbor_alpha = neighbor_roi[:, :, 3] if neighbor_roi.shape[2] == 4 else None
+        # Mask: only where both pieces have content (alpha > 0 from warp)
+        overlap_mask = np.where(
+            (piece_warped[:, :, 3] > 0) & (nb_warped[:, :, 3] > 0),
+            np.uint8(255), np.uint8(0),
+        )
 
-        # Compute features in overlap — no gray masking (matches stitch-images-realign)
-        # nfeatures is per-channel (×3 = total descriptors for BFMatcher)
+        logger.debug("snap %s vs %s: warped ROI %dx%d, overlap=%.0f px²",
+                     piece_lbl, nb_lbl, roi_w, roi_h, overlap_area)
+
+        # Compute features in overlap — no gray masking
         t_orb = time.monotonic()
-        kp_p, des_p = compute_orb_features(piece_roi, nfeatures=5000, gray_masking=False, mask=piece_alpha)
+        kp_p, des_p = compute_orb_features(piece_warped, nfeatures=10000, gray_masking=False, mask=overlap_mask)
         t_orb_piece = time.monotonic() - t_orb
         t_orb = time.monotonic()
-        kp_n, des_n = compute_orb_features(neighbor_roi, nfeatures=5000, gray_masking=False, mask=neighbor_alpha)
+        kp_n, des_n = compute_orb_features(nb_warped, nfeatures=10000, gray_masking=False, mask=overlap_mask)
         t_orb_nb = time.monotonic() - t_orb
         logger.debug("snap %s vs %s: ORB piece %.2fs (%d kp), neighbor %.2fs (%d kp)",
                      piece_lbl, nb_lbl,
@@ -410,7 +414,7 @@ def snap_piece_to_neighbors(piece: "PuzzlePiece", neighbors: list):
             continue
 
         t_match = time.monotonic()
-        bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+        bf = cv2.BFMatcher(cv2.NORM_HAMMING2, crossCheck=True)
         matches = sorted(bf.match(des_p, des_n), key=lambda m: m.distance)[:200]
         t_match = time.monotonic() - t_match
         logger.debug("snap %s vs %s: BFMatcher %.2fs, %d matches",
@@ -420,33 +424,29 @@ def snap_piece_to_neighbors(piece: "PuzzlePiece", neighbors: list):
 
         src_pts = np.float32([kp_p[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
         dst_pts = np.float32([kp_n[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
-        # matrix_roi: maps piece_roi coords -> neighbor_roi coords
+        # matrix_roi maps piece_warped → nb_warped (both in overlap-ROI frame)
         matrix_roi, _ = cv2.estimateAffinePartial2D(src_pts, dst_pts)
         if matrix_roi is None:
             continue
 
-        # Convert ROI matrix to global: piece local -> neighbor local
-        R = matrix_roi[:, :2]
-        corr_piece = R @ np.array([px1, py1])
-        neighbor_local_offset = np.array([nx1, ny1])
-        matrix_piece_to_neighbor_local = matrix_roi.copy()
-        matrix_piece_to_neighbor_local[:, 2] = matrix_roi[:, 2] - corr_piece + neighbor_local_offset
-
-        # Now convert to world coords:
-        M_nb_hom = np.vstack([M_neighbor, [0, 0, 1]])
-        M_ptol_hom = np.vstack([matrix_piece_to_neighbor_local, [0, 0, 1]])
-        M_new_world_hom = M_nb_hom @ M_ptol_hom
+        # Convert to new world transform for the piece:
+        # piece_local →[M_piece]→ world →[M_w2r]→ roi →[matrix_roi]→ roi →[M_r2w]→ world
+        M_r2w_hom = np.linalg.inv(M_w2r_hom)
+        matrix_roi_hom = np.vstack([matrix_roi, [0, 0, 1]])
+        M_new_world_hom = M_r2w_hom @ matrix_roi_hom @ M_w2r_hom @ np.vstack([M_piece, [0, 0, 1]])
         M_new_world = M_new_world_hom[:2, :]
 
-        # Validate with pixel match
-        data_piece = {"image": piece_img, "w": pw, "h": ph}
-        data_neighbor = {"image": neighbor_img, "w": nw, "h": nh}
-        bbox_piece_in_neighbor = cv2.transform(
-            piece_local.reshape(-1, 1, 2), matrix_piece_to_neighbor_local
+        # Validate with pixel match in the overlap-ROI frame
+        roi_corners = np.array(
+            [[0, 0], [roi_w, 0], [roi_w, roi_h], [0, roi_h]], dtype=np.float32
+        )
+        bbox_warped = cv2.transform(
+            roi_corners.reshape(-1, 1, 2), matrix_roi
         ).reshape(-1, 2)
+        data_pw = {"image": piece_warped, "w": roi_w, "h": roi_h}
+        data_nw = {"image": nb_warped, "w": roi_w, "h": roi_h}
         t_pix = time.monotonic()
-        pct = matching_pixels_pct(data_neighbor, data_piece, matrix_piece_to_neighbor_local,
-                                   bbox_piece_in_neighbor)
+        pct = matching_pixels_pct(data_nw, data_pw, matrix_roi, bbox_warped)
         t_pix = time.monotonic() - t_pix
         logger.debug("snap %s vs %s: pixel match %.1f%% (%.2fs)",
                      piece_lbl, nb_lbl, pct, t_pix)
@@ -464,6 +464,8 @@ def snap_piece_to_neighbors(piece: "PuzzlePiece", neighbors: list):
 
     # Decompose new world matrix to update piece params
     # center in world = M_new_world * [w/2, h/2]
+    old_x, old_y = piece.x, piece.y
+    old_rot, old_scale = piece.rotation_deg, piece.scale
     cx_l, cy_l = pw / 2.0, ph / 2.0
     a, b = best_matrix[0, 0], best_matrix[0, 1]
     c2, d = best_matrix[1, 0], best_matrix[1, 1]
@@ -472,6 +474,16 @@ def snap_piece_to_neighbors(piece: "PuzzlePiece", neighbors: list):
     piece.y = c2 * cx_l + d * cy_l + ty2
     piece.scale = math.sqrt(a * a + c2 * c2)
     piece.rotation_deg = math.degrees(math.atan2(c2, a))
+    # Verify round-trip: get_affine_matrix should reproduce best_matrix
+    M_verify = piece.get_affine_matrix()
+    delta_matrix = np.abs(M_verify - best_matrix).max()
+    dx_px = (piece.x - old_x) / piece.scale
+    dy_px = (piece.y - old_y) / piece.scale
+    logger.info("snap %s: pos (%.4f,%.4f)->(%.4f,%.4f) rot %.4f->%.4f "
+                "scale %.6f->%.6f delta=%.2f,%.2f px, matrix_err=%.2e",
+                piece_lbl, old_x, old_y, piece.x, piece.y,
+                old_rot, piece.rotation_deg, old_scale, piece.scale,
+                dx_px, dy_px, delta_matrix)
     logger.debug("snap %s: done, best=%.1f%%, %d matched neighbors (%.2fs total)",
                  piece_lbl, best_pixel, len(matched_neighbors), time.monotonic() - t0)
     return matched_neighbors, best_neighbor

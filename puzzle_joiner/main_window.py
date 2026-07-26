@@ -439,7 +439,7 @@ class MainWindow(QMainWindow):
             return True
 
         def on_done(result):
-            self.scene.sync_all_from_pieces()
+            self._recenter_pieces()
             self.thumbnail_panel.update_all()
             self.view.fit_all()
             self._update_snap_enabled()
@@ -567,7 +567,7 @@ class MainWindow(QMainWindow):
                 snap_pairs = [(p, n) for n in matched_nbs]
                 cmds.append(SnapCommand(
                     p, ox, oy, orot, oscale, omatched, olocked,
-                    p.x, p.y, p.rotation_deg, p.scale, True, True,
+                    p.x, p.y, p.rotation_deg, p.scale, True, olocked,
                     snap_pairs=snap_pairs, scene=self.scene,
                     sync_fn=self._sync_piece,
                 ))
@@ -577,7 +577,7 @@ class MainWindow(QMainWindow):
             else:
                 self.undo_stack.push(SnapAllCommand(cmds))
 
-            self.scene.sync_all_from_pieces()
+            self._recenter_pieces()
             self.thumbnail_panel.update_all()
             n = len(results)
             self.status_bar.showMessage(
@@ -617,13 +617,13 @@ class MainWindow(QMainWindow):
                     snap_pairs = [(p, n) for n in matched]
                     cmds.append(SnapCommand(
                         p, ox, oy, orot, oscale, omatched, olocked,
-                        p.x, p.y, p.rotation_deg, p.scale, True, True,
+                        p.x, p.y, p.rotation_deg, p.scale, True, olocked,
                         snap_pairs=snap_pairs, scene=self.scene,
                         sync_fn=self._sync_piece,
                     ))
                 cmd = SnapAllCommand(cmds)
                 self.undo_stack.push(cmd)
-            self.scene.sync_all_from_pieces()
+            self._recenter_pieces()
             self.thumbnail_panel.update_all()
             self._update_snap_enabled()
             self.status_bar.showMessage("Snap all complete.")
@@ -787,6 +787,19 @@ class MainWindow(QMainWindow):
 
     # --- Auto-save / restore layout ---
 
+    def _recenter_pieces(self):
+        """Shift all pieces so their centroid is at (0,0) to avoid float32 precision issues in Qt."""
+        if not self.pieces:
+            return
+        cx = sum(p.x for p in self.pieces) / len(self.pieces)
+        cy = sum(p.y for p in self.pieces) / len(self.pieces)
+        if abs(cx) < 1 and abs(cy) < 1:
+            return
+        for p in self.pieces:
+            p.x -= cx
+            p.y -= cy
+        self.scene.sync_all_from_pieces()
+
     def _auto_save_layout(self):
         if self._layout_dir and self.pieces:
             save_layout(self._layout_dir, self.pieces, self.scene.snap_pairs)
@@ -798,7 +811,7 @@ class MainWindow(QMainWindow):
             for piece in self.pieces:
                 piece.rebuild_display_pixmap()
                 piece.rebuild_thumbnail()
-            self.scene.sync_all_from_pieces()
+            self._recenter_pieces()
             self.thumbnail_panel.update_all()
             # Restore snap pairs
             by_source = {os.path.basename(p.source_path): p for p in self.pieces}

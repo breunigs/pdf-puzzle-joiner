@@ -142,9 +142,9 @@ class HandleItem(QGraphicsRectItem):
             self._drag_start_piece_y = piece.y
             self._drag_start_scale = piece.scale
             self._drag_start_rot = piece.rotation_deg
-            # Capture snap group start states
+            # Capture drag group start states
             if isinstance(scene, PuzzleScene):
-                group = scene.get_snap_group(piece, locked_only=True)
+                group = scene.get_drag_group(piece)
                 self._drag_group_starts = {p: (p.x, p.y, p.rotation_deg, p.scale) for p in group}
             else:
                 self._drag_group_starts = {piece: (piece.x, piece.y, piece.rotation_deg, piece.scale)}
@@ -323,21 +323,25 @@ class PuzzlePieceItem(QGraphicsPixmapItem):
     def sync_from_piece(self):
         self._syncing = True
         piece = self.piece
-        img = piece.get_cropped_image()
-        h, w = img.shape[:2]
-        ds = piece.display_scale
 
-        # Display pixmap center in item-local coords
-        dcx = (w * ds) / 2.0
-        dcy = (h * ds) / 2.0
+        if self.pixmap() is not piece.display_pixmap:
+            self.setPixmap(piece.display_pixmap)
+
+        # Use actual pixmap center for both pos offset and transformOriginPoint
+        # so they are consistent. Using float w*ds would mismatch with the
+        # int-truncated pixmap dimensions, causing a multi-pixel visual offset.
+        pm = self.pixmap()
+        dcx = pm.width() / 2.0
+        dcy = pm.height() / 2.0
 
         # Qt applies setScale/setRotation around transformOriginPoint (dcx, dcy).
         # The scene position of the origin is always pos + origin, regardless of
         # rotation/scale. So to place the center at (piece.x, piece.y):
         self.setPos(piece.x - dcx, piece.y - dcy)
         self.setRotation(piece.rotation_deg)
-        self.setScale(piece.scale / ds)
+        self.setScale(piece.scale / piece.display_scale)
 
+        self.setTransformOriginPoint(dcx, dcy)
         self.transform_handles.update_positions()
         self._syncing = False
 
@@ -345,8 +349,7 @@ class PuzzlePieceItem(QGraphicsPixmapItem):
         if change == QGraphicsItem.GraphicsItemChange.ItemSelectedHasChanged:
             is_sel = bool(value)
             self.setZValue(5 if is_sel else 0)
-            in_group = self.scene_ref and self.scene_ref.has_snap_partners(self.piece, locked_only=True)
-            self.transform_handles.set_visible(is_sel and (not self.piece.is_locked or in_group))
+            self.transform_handles.set_visible(is_sel)
             if self.scene_ref and hasattr(self.scene_ref, 'piece_selection_changed'):
                 self.scene_ref.piece_selection_changed(self.piece, is_sel)
         return super().itemChange(change, value)
@@ -499,21 +502,8 @@ class PuzzleScene(QGraphicsScene):
             return False
         return True
 
-    def has_snap_partners(self, piece: PuzzlePiece, locked_only=False) -> bool:
-        """Return True if piece is in any snap pair.
-        If locked_only, only count partners that are locked."""
-        for a, b in self.snap_pairs:
-            if a is piece:
-                if not locked_only or b.is_locked:
-                    return True
-            elif b is piece:
-                if not locked_only or a.is_locked:
-                    return True
-        return False
-
-    def get_snap_group(self, piece: PuzzlePiece, locked_only=False) -> list:
-        """Return all pieces connected to piece via snap pairs (including piece itself).
-        If locked_only, only traverse through locked pieces (for drag grouping)."""
+    def get_snap_group(self, piece: PuzzlePiece) -> list:
+        """Return all pieces connected to piece via snap pairs (including piece itself)."""
         if not self.snap_pairs:
             return [piece]
         group = set()
@@ -525,12 +515,17 @@ class PuzzleScene(QGraphicsScene):
             group.add(current)
             for a, b in self.snap_pairs:
                 if a is current and b not in group:
-                    if not locked_only or b.is_locked:
-                        queue.append(b)
+                    queue.append(b)
                 elif b is current and a not in group:
-                    if not locked_only or a.is_locked:
-                        queue.append(a)
+                    queue.append(a)
         return list(group)
+
+    def get_drag_group(self, piece: PuzzlePiece) -> list:
+        """Return all pieces that should move together when dragging piece.
+        Unlocked pieces move individually. Locked pieces move all locked pieces."""
+        if not piece.is_locked:
+            return [piece]
+        return [p for p in self.piece_items if p.is_locked]
 
     def piece_selection_changed(self, piece: PuzzlePiece, selected: bool):
         if selected:
@@ -603,7 +598,7 @@ class PuzzleView(QGraphicsView):
         if not isinstance(scene, PuzzleScene):
             return None
         piece = scene.get_selected_piece()
-        if piece and (not piece.is_locked or scene.has_snap_partners(piece, locked_only=True)):
+        if piece:
             return scene.piece_items.get(piece)
         return None
 
@@ -696,9 +691,9 @@ class PuzzleView(QGraphicsView):
                 self._drag_start_y = piece.y
                 self._drag_start_rot = piece.rotation_deg
                 self._drag_start_scale = piece.scale
-                # Capture start state of all snap group members
+                # Capture start state of all drag group members
                 scene = self.scene()
-                group = scene.get_snap_group(piece, locked_only=True) if isinstance(scene, PuzzleScene) else [piece]
+                group = scene.get_drag_group(piece) if isinstance(scene, PuzzleScene) else [piece]
                 self._drag_group_starts = {p: (p.x, p.y, p.rotation_deg, p.scale) for p in group}
                 if hit == 'inside':
                     self._drag_mode = 'move'
