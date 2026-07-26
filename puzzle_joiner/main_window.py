@@ -300,11 +300,13 @@ class MainWindow(QMainWindow):
             for (path, bgra, crop_rect, idx) in result:
                 self._add_piece_from_array(bgra, path, idx, crop_rect=crop_rect)
             self._layout_dir = cache_dir
-            self._restore_layout()
+            had_layout = self._restore_layout()
             n = len(result)
             name = os.path.basename(pdf_path)
             self.status_bar.showMessage(f"Loaded {n} pages from {name}")
             self.view.fit_all()
+            if not had_layout and len(self.pieces) >= 2:
+                self.on_auto_detect()
 
         cache_dir = _cache_dir_for_pdf(pdf_path)
         self._run_with_progress("Importing PDF", task, on_done=on_done)
@@ -341,9 +343,11 @@ class MainWindow(QMainWindow):
             for (path, bgra, idx) in result:
                 self._add_piece_from_array(bgra, path, idx)
             self._layout_dir = _images_cache_dir(paths)
-            self._restore_layout()
+            had_layout = self._restore_layout()
             self.status_bar.showMessage(f"Loaded {len(result)} images")
             self.view.fit_all()
+            if not had_layout and len(self.pieces) >= 2:
+                self.on_auto_detect()
 
         self._run_with_progress("Loading images", task, on_done=on_done)
 
@@ -712,8 +716,8 @@ class MainWindow(QMainWindow):
         if self._layout_dir and self.pieces:
             save_layout(self._layout_dir, self.pieces, self.scene.snap_pairs)
 
-    def _restore_layout(self):
-        """Restore piece positions and snap pairs from cache."""
+    def _restore_layout(self) -> bool:
+        """Restore piece positions and snap pairs from cache. Returns True if applied."""
         applied, raw_pairs = load_layout(self._layout_dir, self.pieces)
         if applied:
             for piece in self.pieces:
@@ -728,3 +732,4 @@ class MainWindow(QMainWindow):
                 b = by_source.get(b_name)
                 if a and b:
                     self.scene.add_snap_pair(a, b)
+        return applied
