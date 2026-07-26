@@ -400,31 +400,111 @@ class MainWindow(QMainWindow):
             self.status_bar.showMessage("No neighbors found for snapping.")
             return
 
-        # Capture before state
-        old_x, old_y = piece.x, piece.y
-        old_rot, old_scale = piece.rotation_deg, piece.scale
-        old_matched = piece.is_matched
-        old_locked = piece.is_locked
+        # Capture before states for all pieces (recursive snap may affect many)
+        before = {p: (p.x, p.y, p.rotation_deg, p.scale, p.is_matched, p.is_locked)
+                  for p in self.pieces}
 
         def task(progress):
-            progress.emit(20, "Computing features...")
-            matched = snap_piece_to_neighbors(piece, neighbors)
-            progress.emit(90, "Done.")
-            return matched
+            progress.emit(10, "Computing features...")
+            matched, best_nb = snap_piece_to_neighbors(piece, neighbors)
+            if not matched:
+                return None
 
-        def on_done(matched):
-            if matched:
-                snap_pairs = [(piece, n) for n in matched]
-                cmd = SnapCommand(
-                    piece, old_x, old_y, old_rot, old_scale, old_matched, old_locked,
-                    piece.x, piece.y, piece.rotation_deg, piece.scale, True, True,
+            ox, oy, orot, oscale = before[piece][:4]
+            # Results: list of (piece, snap_pair_neighbors)
+            all_results = [(piece, matched)]
+
+            # BFS through overlap chain — anchor (best match) stays fixed
+            processed = {piece}
+            if best_nb:
+                processed.add(best_nb)
+
+            # Enqueue non-anchor neighbors of the snapped piece
+            queue = []
+            for n in neighbors:
+                if n not in processed and not n.is_locked:
+                    queue.append((n, piece, ox, oy, orot, oscale,
+                                 piece.x, piece.y, piece.rotation_deg, piece.scale))
+                    processed.add(n)
+
+            step = 0
+            while queue:
+                step += 1
+                (current, anchor,
+                 ref_ox, ref_oy, ref_orot, ref_oscale,
+                 ref_nx, ref_ny, ref_nrot, ref_nscale) = queue.pop(0)
+
+                progress.emit(10 + min(70, step * 10),
+                              f"Snapping chain piece {step}...")
+
+                # Record current's position before moving it
+                cur_ox, cur_oy = current.x, current.y
+                cur_orot = current.rotation_deg
+                cur_oscale = current.scale
+
+                # Find current's neighbors BEFORE applying rigid delta
+                # (they share bounding boxes at original positions)
+                cur_neighbors = self.scene.get_neighbors(current)
+
+                # Apply rigid delta from reference piece's movement
+                rot_delta = ref_nrot - ref_orot
+                scale_ratio = ref_nscale / ref_oscale if abs(ref_oscale) > 1e-9 else 1.0
+                dx = current.x - ref_ox
+                dy = current.y - ref_oy
+                rad = math.radians(rot_delta)
+                cos_d = math.cos(rad)
+                sin_d = math.sin(rad)
+                current.x = ref_nx + scale_ratio * (cos_d * dx - sin_d * dy)
+                current.y = ref_ny + scale_ratio * (sin_d * dx + cos_d * dy)
+                current.rotation_deg += rot_delta
+                current.scale *= scale_ratio
+
+                # Try to snap current to anchor (feature match refinement)
+                snap_matched, _ = snap_piece_to_neighbors(current, [anchor])
+                if snap_matched:
+                    all_results.append((current, snap_matched))
+                else:
+                    all_results.append((current, []))
+
+                # Enqueue current's overlapping neighbors
+                for n in cur_neighbors:
+                    if n not in processed and not n.is_locked:
+                        queue.append((n, current,
+                                     cur_ox, cur_oy, cur_orot, cur_oscale,
+                                     current.x, current.y,
+                                     current.rotation_deg, current.scale))
+                        processed.add(n)
+
+            progress.emit(90, "Done.")
+            return all_results
+
+        def on_done(results):
+            if results is None:
+                self.status_bar.showMessage("Snap found no match.")
+                self._update_snap_enabled()
+                return
+
+            cmds = []
+            for p, matched_nbs in results:
+                ox, oy, orot, oscale, omatched, olocked = before[p]
+                snap_pairs = [(p, n) for n in matched_nbs]
+                cmds.append(SnapCommand(
+                    p, ox, oy, orot, oscale, omatched, olocked,
+                    p.x, p.y, p.rotation_deg, p.scale, True, True,
                     snap_pairs=snap_pairs, scene=self.scene,
                     sync_fn=self._sync_piece,
-                )
-                self.undo_stack.push(cmd)
-                self.status_bar.showMessage("Snap successful.")
+                ))
+
+            if len(cmds) == 1:
+                self.undo_stack.push(cmds[0])
             else:
-                self.status_bar.showMessage("Snap found no match.")
+                self.undo_stack.push(SnapAllCommand(cmds))
+
+            self.scene.sync_all_from_pieces()
+            self.thumbnail_panel.update_all()
+            n = len(results)
+            self.status_bar.showMessage(
+                f"Snap successful ({n} piece{'s' if n > 1 else ''}).")
             self._update_snap_enabled()
 
         self._run_with_progress("Snapping piece", task, on_done=on_done)
@@ -441,7 +521,7 @@ class MainWindow(QMainWindow):
                 progress.emit(int(90 * i / max(total, 1)), f"Snapping piece {i+1}/{total}...")
                 neighbors = self.scene.get_neighbors(piece)
                 if neighbors:
-                    matched = snap_piece_to_neighbors(piece, neighbors)
+                    matched, _ = snap_piece_to_neighbors(piece, neighbors)
                     if matched:
                         piece.is_matched = True
                         results.append((piece, matched))

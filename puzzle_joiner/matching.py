@@ -313,6 +313,7 @@ def snap_piece_to_neighbors(piece: "PuzzlePiece", neighbors: list):
 
     best_matrix = None
     best_pixel = 0.0
+    best_neighbor = None
     matched_neighbors = []
 
     # Pre-compute piece geometry (invariant across neighbors)
@@ -454,11 +455,12 @@ def snap_piece_to_neighbors(piece: "PuzzlePiece", neighbors: list):
         if pct > best_pixel:
             best_pixel = pct
             best_matrix = M_new_world
+            best_neighbor = neighbor
 
     if best_matrix is None or best_pixel < 0.5:
         logger.debug("snap %s: no match found (%.2fs total)",
                      piece_lbl, time.monotonic() - t0)
-        return []
+        return [], None
 
     # Decompose new world matrix to update piece params
     # center in world = M_new_world * [w/2, h/2]
@@ -472,4 +474,4 @@ def snap_piece_to_neighbors(piece: "PuzzlePiece", neighbors: list):
     piece.rotation_deg = math.degrees(math.atan2(c2, a))
     logger.debug("snap %s: done, best=%.1f%%, %d matched neighbors (%.2fs total)",
                  piece_lbl, best_pixel, len(matched_neighbors), time.monotonic() - t0)
-    return matched_neighbors
+    return matched_neighbors, best_neighbor

@@ -145,7 +145,7 @@ class HandleItem(QGraphicsRectItem):
             self._drag_start_rot = piece.rotation_deg
             # Capture snap group start states
             if isinstance(scene, PuzzleScene):
-                group = scene.get_snap_group(piece)
+                group = scene.get_snap_group(piece, locked_only=True)
                 self._drag_group_starts = {p: (p.x, p.y, p.rotation_deg, p.scale) for p in group}
             else:
                 self._drag_group_starts = {piece: (piece.x, piece.y, piece.rotation_deg, piece.scale)}
@@ -346,7 +346,7 @@ class PuzzlePieceItem(QGraphicsPixmapItem):
         if change == QGraphicsItem.GraphicsItemChange.ItemSelectedHasChanged:
             is_sel = bool(value)
             self.setZValue(5 if is_sel else 0)
-            in_group = self.scene_ref and self.scene_ref.has_snap_partners(self.piece)
+            in_group = self.scene_ref and self.scene_ref.has_snap_partners(self.piece, locked_only=True)
             self.transform_handles.set_visible(is_sel and (not self.piece.is_locked or in_group))
             if self.scene_ref and hasattr(self.scene_ref, 'piece_selection_changed'):
                 self.scene_ref.piece_selection_changed(self.piece, is_sel)
@@ -462,12 +462,21 @@ class PuzzleScene(QGraphicsScene):
         self.snap_pairs = [(pa, pb) for pa, pb in self.snap_pairs
                            if not ((pa is a and pb is b) or (pa is b and pb is a))]
 
-    def has_snap_partners(self, piece: PuzzlePiece) -> bool:
-        """Return True if piece is in any snap pair."""
-        return any(a is piece or b is piece for a, b in self.snap_pairs)
+    def has_snap_partners(self, piece: PuzzlePiece, locked_only=False) -> bool:
+        """Return True if piece is in any snap pair.
+        If locked_only, only count partners that are locked."""
+        for a, b in self.snap_pairs:
+            if a is piece:
+                if not locked_only or b.is_locked:
+                    return True
+            elif b is piece:
+                if not locked_only or a.is_locked:
+                    return True
+        return False
 
-    def get_snap_group(self, piece: PuzzlePiece) -> list:
-        """Return all pieces connected to piece via snap pairs (including piece itself)."""
+    def get_snap_group(self, piece: PuzzlePiece, locked_only=False) -> list:
+        """Return all pieces connected to piece via snap pairs (including piece itself).
+        If locked_only, only traverse through locked pieces (for drag grouping)."""
         if not self.snap_pairs:
             return [piece]
         group = set()
@@ -479,9 +488,11 @@ class PuzzleScene(QGraphicsScene):
             group.add(current)
             for a, b in self.snap_pairs:
                 if a is current and b not in group:
-                    queue.append(b)
+                    if not locked_only or b.is_locked:
+                        queue.append(b)
                 elif b is current and a not in group:
-                    queue.append(a)
+                    if not locked_only or a.is_locked:
+                        queue.append(a)
         return list(group)
 
     def piece_selection_changed(self, piece: PuzzlePiece, selected: bool):
@@ -555,7 +566,7 @@ class PuzzleView(QGraphicsView):
         if not isinstance(scene, PuzzleScene):
             return None
         piece = scene.get_selected_piece()
-        if piece and (not piece.is_locked or scene.has_snap_partners(piece)):
+        if piece and (not piece.is_locked or scene.has_snap_partners(piece, locked_only=True)):
             return scene.piece_items.get(piece)
         return None
 
@@ -650,7 +661,7 @@ class PuzzleView(QGraphicsView):
                 self._drag_start_scale = piece.scale
                 # Capture start state of all snap group members
                 scene = self.scene()
-                group = scene.get_snap_group(piece) if isinstance(scene, PuzzleScene) else [piece]
+                group = scene.get_snap_group(piece, locked_only=True) if isinstance(scene, PuzzleScene) else [piece]
                 self._drag_group_starts = {p: (p.x, p.y, p.rotation_deg, p.scale) for p in group}
                 if hit == 'inside':
                     self._drag_mode = 'move'
