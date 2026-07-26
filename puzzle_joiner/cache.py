@@ -58,8 +58,8 @@ def _layout_path(cache_dir: str) -> str:
     return os.path.join(cache_dir, "layout.json")
 
 
-def save_layout(cache_dir: str, pieces) -> None:
-    """Save piece layout state (position, rotation, scale, flags) to cache dir."""
+def save_layout(cache_dir: str, pieces, snap_pairs=None) -> None:
+    """Save piece layout state and snap pairs to cache dir."""
     if not cache_dir:
         return
     entries = []
@@ -74,20 +74,36 @@ def save_layout(cache_dir: str, pieces) -> None:
             "is_locked": piece.is_locked,
             "crop_rect": list(piece.crop_rect) if piece.crop_rect is not None else None,
         })
+    data = {"pieces": entries}
+    if snap_pairs:
+        data["snap_pairs"] = [
+            [os.path.basename(a.source_path), os.path.basename(b.source_path)]
+            for a, b in snap_pairs
+        ]
     path = _layout_path(cache_dir)
     with open(path, "w") as f:
-        json.dump(entries, f, indent=1)
+        json.dump(data, f, indent=1)
 
 
-def load_layout(cache_dir: str, pieces) -> bool:
-    """Restore piece layout state from cache dir. Returns True if layout was applied."""
+def load_layout(cache_dir: str, pieces):
+    """Restore piece layout state from cache dir.
+
+    Returns (applied: bool, snap_pairs: list of [basename_a, basename_b]).
+    """
     if not cache_dir:
-        return False
+        return False, []
     path = _layout_path(cache_dir)
     if not os.path.exists(path):
-        return False
+        return False, []
     with open(path, "r") as f:
-        entries = json.load(f)
+        raw = json.load(f)
+    # Handle both old format (flat list) and new format (dict with pieces/snap_pairs)
+    if isinstance(raw, list):
+        entries = raw
+        raw_snap_pairs = []
+    else:
+        entries = raw.get("pieces", [])
+        raw_snap_pairs = raw.get("snap_pairs", [])
     by_source = {e["source"]: e for e in entries}
     applied = False
     for piece in pieces:
@@ -105,7 +121,7 @@ def load_layout(cache_dir: str, pieces) -> bool:
         if saved_crop is not None:
             piece.crop_rect = tuple(saved_crop)
         applied = True
-    return applied
+    return applied, raw_snap_pairs
 
 
 def _images_cache_dir(image_paths: list) -> str:

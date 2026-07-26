@@ -37,11 +37,12 @@ class TransformCommand(QUndoCommand):
 
 
 class SnapCommand(QUndoCommand):
-    """Undoable snap operation — may change position/rotation/scale and is_matched."""
+    """Undoable snap operation — may change position/rotation/scale, is_matched, is_locked,
+    and snap pair relationships."""
 
-    def __init__(self, piece, old_x, old_y, old_rot, old_scale, old_matched,
-                 new_x, new_y, new_rot, new_scale, new_matched,
-                 sync_fn=None):
+    def __init__(self, piece, old_x, old_y, old_rot, old_scale, old_matched, old_locked,
+                 new_x, new_y, new_rot, new_scale, new_matched, new_locked,
+                 snap_pairs=None, scene=None, sync_fn=None):
         super().__init__("Snap")
         self.piece = piece
         self.old_x = old_x
@@ -49,11 +50,15 @@ class SnapCommand(QUndoCommand):
         self.old_rot = old_rot
         self.old_scale = old_scale
         self.old_matched = old_matched
+        self.old_locked = old_locked
         self.new_x = new_x
         self.new_y = new_y
         self.new_rot = new_rot
         self.new_scale = new_scale
         self.new_matched = new_matched
+        self.new_locked = new_locked
+        self.snap_pairs = snap_pairs or []  # list of (piece, neighbor) tuples
+        self.scene = scene
         self.sync_fn = sync_fn
 
     def redo(self):
@@ -62,15 +67,23 @@ class SnapCommand(QUndoCommand):
         self.piece.rotation_deg = self.new_rot
         self.piece.scale = self.new_scale
         self.piece.is_matched = self.new_matched
+        self.piece.is_locked = self.new_locked
+        if self.scene:
+            for pair in self.snap_pairs:
+                self.scene.add_snap_pair(*pair)
         if self.sync_fn:
             self.sync_fn(self.piece)
 
     def undo(self):
+        if self.scene:
+            for pair in self.snap_pairs:
+                self.scene.remove_snap_pair(*pair)
         self.piece.x = self.old_x
         self.piece.y = self.old_y
         self.piece.rotation_deg = self.old_rot
         self.piece.scale = self.old_scale
         self.piece.is_matched = self.old_matched
+        self.piece.is_locked = self.old_locked
         if self.sync_fn:
             self.sync_fn(self.piece)
 
@@ -81,6 +94,22 @@ class SnapAllCommand(QUndoCommand):
     def __init__(self, snap_commands):
         super().__init__("Snap All")
         self._commands = snap_commands
+
+    def redo(self):
+        for cmd in self._commands:
+            cmd.redo()
+
+    def undo(self):
+        for cmd in reversed(self._commands):
+            cmd.undo()
+
+
+class GroupTransformCommand(QUndoCommand):
+    """Undoable transform of multiple pieces (snap group movement)."""
+
+    def __init__(self, commands, description="Group Transform"):
+        super().__init__(description)
+        self._commands = commands
 
     def redo(self):
         for cmd in self._commands:

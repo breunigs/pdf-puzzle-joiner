@@ -127,6 +127,7 @@ class HandleItem(QGraphicsRectItem):
         self._drag_start_piece_y = 0.0
         self._drag_start_scale = 1.0
         self._drag_start_rot = 0.0
+        self._drag_group_starts = {}  # {PuzzlePiece: (x, y, rot, scale)}
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -142,6 +143,12 @@ class HandleItem(QGraphicsRectItem):
             self._drag_start_piece_y = piece.y
             self._drag_start_scale = piece.scale
             self._drag_start_rot = piece.rotation_deg
+            # Capture snap group start states
+            if isinstance(scene, PuzzleScene):
+                group = scene.get_snap_group(piece)
+                self._drag_group_starts = {p: (p.x, p.y, p.rotation_deg, p.scale) for p in group}
+            else:
+                self._drag_group_starts = {piece: (piece.x, piece.y, piece.rotation_deg, piece.scale)}
             event.accept()
         else:
             super().mousePressEvent(event)
@@ -153,10 +160,9 @@ class HandleItem(QGraphicsRectItem):
         event.accept()
         piece_item = self.parentItem()
         piece = piece_item.piece
-        img = piece.get_cropped_image()
-        h, w = img.shape[:2]
-        cx_world = piece.x
-        cy_world = piece.y
+        scene = self.scene()
+        cx_world = self._drag_start_piece_x
+        cy_world = self._drag_start_piece_y
 
         current_pos = event.scenePos()
 
@@ -169,7 +175,19 @@ class HandleItem(QGraphicsRectItem):
                 current_pos.y() - cy_world,
                 current_pos.x() - cx_world,
             ))
-            piece.rotation_deg = self._drag_start_rot + (current_angle - start_angle)
+            delta_rot = current_angle - start_angle
+            rad = math.radians(delta_rot)
+            cos_d = math.cos(rad)
+            sin_d = math.sin(rad)
+            for p, (sx, sy, sr, ss) in self._drag_group_starts.items():
+                dx = sx - cx_world
+                dy = sy - cy_world
+                p.x = cx_world + cos_d * dx - sin_d * dy
+                p.y = cy_world + sin_d * dx + cos_d * dy
+                p.rotation_deg = sr + delta_rot
+                item = scene.piece_items.get(p) if isinstance(scene, PuzzleScene) else None
+                if item:
+                    item.sync_from_piece()
         else:
             # Scale from center
             start_dist = math.sqrt(
@@ -182,9 +200,15 @@ class HandleItem(QGraphicsRectItem):
             )
             if start_dist > 1e-6:
                 ratio = current_dist / start_dist
-                piece.scale = max(0.01, self._drag_start_scale * ratio)
-
-        piece_item.sync_from_piece()
+                for p, (sx, sy, sr, ss) in self._drag_group_starts.items():
+                    dx = sx - cx_world
+                    dy = sy - cy_world
+                    p.x = cx_world + dx * ratio
+                    p.y = cy_world + dy * ratio
+                    p.scale = max(0.01, ss * ratio)
+                    item = scene.piece_items.get(p) if isinstance(scene, PuzzleScene) else None
+                    if item:
+                        item.sync_from_piece()
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -198,13 +222,30 @@ class HandleItem(QGraphicsRectItem):
                        piece.scale != self._drag_start_scale)
             if changed:
                 desc = "Rotate" if self.handle_type == self.ROTATE else "Scale"
-                piece_item.push_transform_command(
-                    self._drag_start_piece_x, self._drag_start_piece_y,
-                    self._drag_start_rot, self._drag_start_scale, desc,
-                )
+                scene = self.scene()
+                if isinstance(scene, PuzzleScene) and scene.undo_stack and len(self._drag_group_starts) > 1:
+                    from .undo import TransformCommand, GroupTransformCommand
+                    cmds = []
+                    for p, (ox, oy, orot, oscale) in self._drag_group_starts.items():
+                        if p.x != ox or p.y != oy or p.rotation_deg != orot or p.scale != oscale:
+                            item = scene.piece_items.get(p)
+                            sync_fn = item._undo_sync if item else None
+                            cmds.append(TransformCommand(
+                                p, ox, oy, orot, oscale,
+                                p.x, p.y, p.rotation_deg, p.scale,
+                                sync_fn=sync_fn, description=desc,
+                            ))
+                    if cmds:
+                        scene.undo_stack.push(GroupTransformCommand(cmds, desc))
+                else:
+                    piece_item.push_transform_command(
+                        self._drag_start_piece_x, self._drag_start_piece_y,
+                        self._drag_start_rot, self._drag_start_scale, desc,
+                    )
             scene = self.scene()
             if scene and hasattr(scene, 'piece_moved_signal'):
                 scene.piece_moved_signal.emit()
+            self._drag_group_starts = {}
         else:
             super().mouseReleaseEvent(event)
 
@@ -304,7 +345,8 @@ class PuzzlePieceItem(QGraphicsPixmapItem):
     def itemChange(self, change, value):
         if change == QGraphicsItem.GraphicsItemChange.ItemSelectedHasChanged:
             is_sel = bool(value)
-            self.transform_handles.set_visible(is_sel and not self.piece.is_locked)
+            in_group = self.scene_ref and self.scene_ref.has_snap_partners(self.piece)
+            self.transform_handles.set_visible(is_sel and (not self.piece.is_locked or in_group))
             if self.scene_ref and hasattr(self.scene_ref, 'piece_selection_changed'):
                 self.scene_ref.piece_selection_changed(self.piece, is_sel)
         return super().itemChange(change, value)
@@ -358,6 +400,7 @@ class PuzzleScene(QGraphicsScene):
     def __init__(self, undo_stack=None):
         super().__init__()
         self.piece_items: dict = {}  # PuzzlePiece -> PuzzlePieceItem
+        self.snap_pairs: list = []   # list of (PuzzlePiece, PuzzlePiece) tuples
         self.undo_stack = undo_stack
         self.editing_enabled = True
         self.setSceneRect(-50000, -50000, 100000, 100000)
@@ -373,6 +416,8 @@ class PuzzleScene(QGraphicsScene):
         item = self.piece_items.pop(piece, None)
         if item:
             self.removeItem(item)
+            self.snap_pairs = [(a, b) for a, b in self.snap_pairs
+                               if a is not piece and b is not piece]
             self.update_scene_rect()
 
     def update_scene_rect(self):
@@ -401,6 +446,42 @@ class PuzzleScene(QGraphicsScene):
             if p.get_bounding_box().intersects(expanded):
                 neighbors.append(p)
         return neighbors
+
+    # --- Snap group management ---
+
+    def add_snap_pair(self, a: PuzzlePiece, b: PuzzlePiece):
+        """Record that pieces a and b are snapped together."""
+        for pa, pb in self.snap_pairs:
+            if (pa is a and pb is b) or (pa is b and pb is a):
+                return  # already exists
+        self.snap_pairs.append((a, b))
+
+    def remove_snap_pair(self, a: PuzzlePiece, b: PuzzlePiece):
+        """Remove a snap pair."""
+        self.snap_pairs = [(pa, pb) for pa, pb in self.snap_pairs
+                           if not ((pa is a and pb is b) or (pa is b and pb is a))]
+
+    def has_snap_partners(self, piece: PuzzlePiece) -> bool:
+        """Return True if piece is in any snap pair."""
+        return any(a is piece or b is piece for a, b in self.snap_pairs)
+
+    def get_snap_group(self, piece: PuzzlePiece) -> list:
+        """Return all pieces connected to piece via snap pairs (including piece itself)."""
+        if not self.snap_pairs:
+            return [piece]
+        group = set()
+        queue = [piece]
+        while queue:
+            current = queue.pop()
+            if current in group:
+                continue
+            group.add(current)
+            for a, b in self.snap_pairs:
+                if a is current and b not in group:
+                    queue.append(b)
+                elif b is current and a not in group:
+                    queue.append(a)
+        return list(group)
 
     def piece_selection_changed(self, piece: PuzzlePiece, selected: bool):
         if selected:
@@ -439,6 +520,7 @@ class PuzzleView(QGraphicsView):
         self._drag_start_rot = 0.0
         self._drag_start_scale = 1.0
         self._drag_piece_item = None
+        self._drag_group_starts = {}  # {PuzzlePiece: (x, y, rot, scale)}
         self._scroll_anim = None
 
     def smoothCenterOn(self, x, y, duration_ms=500):
@@ -472,7 +554,7 @@ class PuzzleView(QGraphicsView):
         if not isinstance(scene, PuzzleScene):
             return None
         piece = scene.get_selected_piece()
-        if piece and not piece.is_locked:
+        if piece and (not piece.is_locked or scene.has_snap_partners(piece)):
             return scene.piece_items.get(piece)
         return None
 
@@ -565,6 +647,10 @@ class PuzzleView(QGraphicsView):
                 self._drag_start_y = piece.y
                 self._drag_start_rot = piece.rotation_deg
                 self._drag_start_scale = piece.scale
+                # Capture start state of all snap group members
+                scene = self.scene()
+                group = scene.get_snap_group(piece) if isinstance(scene, PuzzleScene) else [piece]
+                self._drag_group_starts = {p: (p.x, p.y, p.rotation_deg, p.scale) for p in group}
                 if hit == 'inside':
                     self._drag_mode = 'move'
                     self.setCursor(QCursor(Qt.CursorShape.SizeAllCursor))
@@ -592,15 +678,20 @@ class PuzzleView(QGraphicsView):
         if self._drag_mode and self._drag_piece_item:
             scene_pos = self.mapToScene(event.pos())
             piece = self._drag_piece_item.piece
+            scene = self.scene()
 
             if self._drag_mode == 'move':
                 dx = scene_pos.x() - self._drag_start_scene.x()
                 dy = scene_pos.y() - self._drag_start_scene.y()
-                piece.x = self._drag_start_x + dx
-                piece.y = self._drag_start_y + dy
-                self._drag_piece_item.sync_from_piece()
+                for p, (sx, sy, sr, ss) in self._drag_group_starts.items():
+                    p.x = sx + dx
+                    p.y = sy + dy
+                    item = scene.piece_items.get(p)
+                    if item:
+                        item.sync_from_piece()
             elif self._drag_mode == 'rotate':
-                cx, cy = piece.x, piece.y
+                # Rotate around selected piece's (fixed) center
+                cx, cy = self._drag_start_x, self._drag_start_y
                 start_angle = math.degrees(math.atan2(
                     self._drag_start_scene.y() - cy,
                     self._drag_start_scene.x() - cx,
@@ -609,8 +700,19 @@ class PuzzleView(QGraphicsView):
                     scene_pos.y() - cy,
                     scene_pos.x() - cx,
                 ))
-                piece.rotation_deg = self._drag_start_rot + (current_angle - start_angle)
-                self._drag_piece_item.sync_from_piece()
+                delta_rot = current_angle - start_angle
+                rad = math.radians(delta_rot)
+                cos_d = math.cos(rad)
+                sin_d = math.sin(rad)
+                for p, (sx, sy, sr, ss) in self._drag_group_starts.items():
+                    dx = sx - self._drag_start_x
+                    dy = sy - self._drag_start_y
+                    p.x = self._drag_start_x + cos_d * dx - sin_d * dy
+                    p.y = self._drag_start_y + sin_d * dx + cos_d * dy
+                    p.rotation_deg = sr + delta_rot
+                    item = scene.piece_items.get(p)
+                    if item:
+                        item.sync_from_piece()
             event.accept()
             return
 
@@ -636,21 +738,42 @@ class PuzzleView(QGraphicsView):
                        piece.scale != self._drag_start_scale)
             if changed:
                 desc = "Move" if self._drag_mode == 'move' else "Rotate"
-                self._drag_piece_item.push_transform_command(
-                    self._drag_start_x, self._drag_start_y,
-                    self._drag_start_rot, self._drag_start_scale, desc,
-                )
+                self._push_group_transform_command(desc)
             scene = self.scene()
             if hasattr(scene, 'piece_moved_signal'):
                 scene.piece_moved_signal.emit()
             self._drag_mode = None
             self._drag_piece_item = None
+            self._drag_group_starts = {}
             self._update_hover_cursor(event.pos())
             event.accept()
             return
 
         super().mouseReleaseEvent(event)
         self._update_hover_cursor(event.pos())
+
+    def _push_group_transform_command(self, desc):
+        """Push undo command(s) for all pieces in the drag group that changed."""
+        scene = self.scene()
+        if not isinstance(scene, PuzzleScene) or not scene.undo_stack:
+            return
+        from .undo import TransformCommand, GroupTransformCommand
+        cmds = []
+        for p, (ox, oy, orot, oscale) in self._drag_group_starts.items():
+            if p.x != ox or p.y != oy or p.rotation_deg != orot or p.scale != oscale:
+                item = scene.piece_items.get(p)
+                sync_fn = item._undo_sync if item else None
+                cmds.append(TransformCommand(
+                    p, ox, oy, orot, oscale,
+                    p.x, p.y, p.rotation_deg, p.scale,
+                    sync_fn=sync_fn, description=desc,
+                ))
+        if not cmds:
+            return
+        if len(cmds) == 1:
+            scene.undo_stack.push(cmds[0])
+        else:
+            scene.undo_stack.push(GroupTransformCommand(cmds, desc))
 
     def fit_all(self):
         rect = self.scene().itemsBoundingRect()

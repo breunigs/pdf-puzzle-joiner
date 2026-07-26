@@ -1,3 +1,4 @@
+import math
 import os
 import sys
 import tempfile
@@ -299,12 +300,7 @@ class MainWindow(QMainWindow):
             for (path, bgra, crop_rect, idx) in result:
                 self._add_piece_from_array(bgra, path, idx, crop_rect=crop_rect)
             self._layout_dir = cache_dir
-            if load_layout(self._layout_dir, self.pieces):
-                for piece in self.pieces:
-                    piece.rebuild_display_pixmap()
-                    piece.rebuild_thumbnail()
-                self.scene.sync_all_from_pieces()
-                self.thumbnail_panel.update_all()
+            self._restore_layout()
             n = len(result)
             name = os.path.basename(pdf_path)
             self.status_bar.showMessage(f"Loaded {n} pages from {name}")
@@ -345,12 +341,7 @@ class MainWindow(QMainWindow):
             for (path, bgra, idx) in result:
                 self._add_piece_from_array(bgra, path, idx)
             self._layout_dir = _images_cache_dir(paths)
-            if load_layout(self._layout_dir, self.pieces):
-                for piece in self.pieces:
-                    piece.rebuild_display_pixmap()
-                    piece.rebuild_thumbnail()
-                self.scene.sync_all_from_pieces()
-                self.thumbnail_panel.update_all()
+            self._restore_layout()
             self.status_bar.showMessage(f"Loaded {len(result)} images")
             self.view.fit_all()
 
@@ -413,21 +404,23 @@ class MainWindow(QMainWindow):
         old_x, old_y = piece.x, piece.y
         old_rot, old_scale = piece.rotation_deg, piece.scale
         old_matched = piece.is_matched
+        old_locked = piece.is_locked
 
         def task(progress):
             progress.emit(20, "Computing features...")
-            ok = snap_piece_to_neighbors(piece, neighbors)
+            matched = snap_piece_to_neighbors(piece, neighbors)
             progress.emit(90, "Done.")
-            return ok
+            return matched
 
-        def on_done(ok):
-            if ok:
+        def on_done(matched):
+            if matched:
+                snap_pairs = [(piece, n) for n in matched]
                 cmd = SnapCommand(
-                    piece, old_x, old_y, old_rot, old_scale, old_matched,
-                    piece.x, piece.y, piece.rotation_deg, piece.scale, True,
+                    piece, old_x, old_y, old_rot, old_scale, old_matched, old_locked,
+                    piece.x, piece.y, piece.rotation_deg, piece.scale, True, True,
+                    snap_pairs=snap_pairs, scene=self.scene,
                     sync_fn=self._sync_piece,
                 )
-                # Already applied by snap_piece_to_neighbors, so push without re-doing
                 self.undo_stack.push(cmd)
                 self.status_bar.showMessage("Snap successful.")
             else:
@@ -438,30 +431,32 @@ class MainWindow(QMainWindow):
 
     def _snap_all(self):
         # Capture before states for all pieces
-        before = {p: (p.x, p.y, p.rotation_deg, p.scale, p.is_matched)
+        before = {p: (p.x, p.y, p.rotation_deg, p.scale, p.is_matched, p.is_locked)
                   for p in self.pieces}
 
         def task(progress):
             total = len(self.pieces)
-            snapped = []
+            results = []  # list of (piece, matched_neighbors)
             for i, piece in enumerate(self.pieces):
                 progress.emit(int(90 * i / max(total, 1)), f"Snapping piece {i+1}/{total}...")
                 neighbors = self.scene.get_neighbors(piece)
                 if neighbors:
-                    ok = snap_piece_to_neighbors(piece, neighbors)
-                    if ok:
+                    matched = snap_piece_to_neighbors(piece, neighbors)
+                    if matched:
                         piece.is_matched = True
-                        snapped.append(piece)
-            return snapped
+                        results.append((piece, matched))
+            return results
 
-        def on_done(snapped):
-            if snapped:
+        def on_done(results):
+            if results:
                 cmds = []
-                for p in snapped:
-                    ox, oy, orot, oscale, omatched = before[p]
+                for p, matched in results:
+                    ox, oy, orot, oscale, omatched, olocked = before[p]
+                    snap_pairs = [(p, n) for n in matched]
                     cmds.append(SnapCommand(
-                        p, ox, oy, orot, oscale, omatched,
-                        p.x, p.y, p.rotation_deg, p.scale, True,
+                        p, ox, oy, orot, oscale, omatched, olocked,
+                        p.x, p.y, p.rotation_deg, p.scale, True, True,
+                        snap_pairs=snap_pairs, scene=self.scene,
                         sync_fn=self._sync_piece,
                     ))
                 cmd = SnapAllCommand(cmds)
@@ -480,8 +475,32 @@ class MainWindow(QMainWindow):
         if piece is None:
             self.status_bar.showMessage("Select a piece first.")
             return
+        old_crop = piece.crop_rect
         dlg = CutToolDialog(piece, self)
         if dlg.exec() == QDialog.DialogCode.Accepted:
+            new_crop = piece.crop_rect
+            # Adjust position so the same image content stays at the same
+            # world coordinates (critical for preserving snap alignment).
+            if old_crop != new_crop:
+                h, w = piece.image.shape[:2]
+                if old_crop:
+                    ocx, ocy, ocw, och = old_crop
+                    old_cx = ocx + ocw / 2.0
+                    old_cy = ocy + och / 2.0
+                else:
+                    old_cx, old_cy = w / 2.0, h / 2.0
+                if new_crop:
+                    ncx, ncy, ncw, nch = new_crop
+                    new_cx = ncx + ncw / 2.0
+                    new_cy = ncy + nch / 2.0
+                else:
+                    new_cx, new_cy = w / 2.0, h / 2.0
+                dx = new_cx - old_cx
+                dy = new_cy - old_cy
+                cos_a = math.cos(math.radians(piece.rotation_deg))
+                sin_a = math.sin(math.radians(piece.rotation_deg))
+                piece.x += piece.scale * (cos_a * dx - sin_a * dy)
+                piece.y += piece.scale * (sin_a * dx + cos_a * dy)
             item = self.scene.piece_items.get(piece)
             if item:
                 item.rebuild_pixmap()
@@ -585,8 +604,25 @@ class MainWindow(QMainWindow):
             idx = (cur_idx + (1 if forward else -1)) % len(self.pieces)
         self.on_thumbnail_select(self.pieces[idx])
 
-    # --- Auto-save layout ---
+    # --- Auto-save / restore layout ---
 
     def _auto_save_layout(self):
         if self._layout_dir and self.pieces:
-            save_layout(self._layout_dir, self.pieces)
+            save_layout(self._layout_dir, self.pieces, self.scene.snap_pairs)
+
+    def _restore_layout(self):
+        """Restore piece positions and snap pairs from cache."""
+        applied, raw_pairs = load_layout(self._layout_dir, self.pieces)
+        if applied:
+            for piece in self.pieces:
+                piece.rebuild_display_pixmap()
+                piece.rebuild_thumbnail()
+            self.scene.sync_all_from_pieces()
+            self.thumbnail_panel.update_all()
+            # Restore snap pairs
+            by_source = {os.path.basename(p.source_path): p for p in self.pieces}
+            for a_name, b_name in raw_pairs:
+                a = by_source.get(a_name)
+                b = by_source.get(b_name)
+                if a and b:
+                    self.scene.add_snap_pair(a, b)

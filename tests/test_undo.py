@@ -9,7 +9,7 @@ from PySide6.QtWidgets import QApplication
 from PySide6.QtGui import QUndoStack
 
 from puzzle_joiner.model import PuzzlePiece
-from puzzle_joiner.undo import TransformCommand, SnapCommand, SnapAllCommand, LockCommand
+from puzzle_joiner.undo import TransformCommand, SnapCommand, SnapAllCommand, GroupTransformCommand, LockCommand
 
 app = QApplication.instance() or QApplication(sys.argv)
 
@@ -59,14 +59,17 @@ class TestSnapCommand:
         stack = QUndoStack()
         p = _make_piece()
         p.is_matched = False
-        cmd = SnapCommand(p, 50, 50, 0, 1, False, 80, 90, 10, 1.5, True)
+        cmd = SnapCommand(p, 50, 50, 0, 1, False, False,
+                          80, 90, 10, 1.5, True, True)
         stack.push(cmd)
         assert p.is_matched is True
+        assert p.is_locked is True
         assert p.x == 80
         assert p.rotation_deg == 10
 
         stack.undo()
         assert p.is_matched is False
+        assert p.is_locked is False
         assert p.x == 50
         assert p.rotation_deg == 0
 
@@ -79,8 +82,10 @@ class TestSnapAllCommand:
         p2.x = 200
 
         cmds = [
-            SnapCommand(p1, 50, 50, 0, 1, False, 60, 60, 5, 1, True),
-            SnapCommand(p2, 200, 50, 0, 1, False, 210, 60, -5, 1, True),
+            SnapCommand(p1, 50, 50, 0, 1, False, False,
+                        60, 60, 5, 1, True, True),
+            SnapCommand(p2, 200, 50, 0, 1, False, False,
+                        210, 60, -5, 1, True, True),
         ]
         stack.push(SnapAllCommand(cmds))
         assert p1.x == 60
@@ -91,6 +96,29 @@ class TestSnapAllCommand:
         assert p2.x == 200
         assert p1.is_matched is False
         assert p2.is_matched is False
+
+
+class TestGroupTransformCommand:
+    def test_undo_redo(self):
+        stack = QUndoStack()
+        p1 = _make_piece()
+        p2 = _make_piece()
+        p2.x = 200
+        cmds = [
+            TransformCommand(p1, 50, 50, 0, 1, 60, 70, 10, 1.2),
+            TransformCommand(p2, 200, 50, 0, 1, 210, 70, 10, 1.2),
+        ]
+        stack.push(GroupTransformCommand(cmds))
+        assert p1.x == 60
+        assert p2.x == 210
+
+        stack.undo()
+        assert p1.x == 50
+        assert p2.x == 200
+
+        stack.redo()
+        assert p1.x == 60
+        assert p2.x == 210
 
 
 class TestLockCommand:

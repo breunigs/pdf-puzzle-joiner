@@ -299,6 +299,7 @@ def snap_piece_to_neighbors(piece: "PuzzlePiece", neighbors: list):
 
     best_matrix = None
     best_pixel = 0.0
+    matched_neighbors = []
 
     for neighbor in neighbors:
         if neighbor is piece:
@@ -370,11 +371,6 @@ def snap_piece_to_neighbors(piece: "PuzzlePiece", neighbors: list):
             continue
 
         # Convert ROI matrix to global: piece local -> neighbor local
-        # P_neighbor_roi = M_roi * (P_piece - piece_roi_offset) + neighbor_roi_offset
-        # P_neighbor = P_neighbor_roi + neighbor_roi_offset_in_local... no:
-        # P_neighbor_local = M_roi * P_piece_roi + corr
-        # P_piece_roi = P_piece_local - (px1, py1)
-        # P_neighbor_local = M_roi * (P_piece_local - (px1, py1)) + (nx1, ny1)
         R = matrix_roi[:, :2]
         corr_piece = R @ np.array([px1, py1])
         neighbor_local_offset = np.array([nx1, ny1])
@@ -382,10 +378,6 @@ def snap_piece_to_neighbors(piece: "PuzzlePiece", neighbors: list):
         matrix_piece_to_neighbor_local[:, 2] = matrix_roi[:, 2] - corr_piece + neighbor_local_offset
 
         # Now convert to world coords:
-        # P_world = M_neighbor * P_neighbor_local
-        # We want M_new such that piece center maps to new world position.
-        # Actually we want the world transform for the piece:
-        # P_world = M_neighbor * M_piece_to_neighbor_local * P_piece_local
         M_nb = neighbor.get_affine_matrix()
         M_nb_hom = np.vstack([M_nb, [0, 0, 1]])
         M_ptol_hom = np.vstack([matrix_piece_to_neighbor_local, [0, 0, 1]])
@@ -401,12 +393,14 @@ def snap_piece_to_neighbors(piece: "PuzzlePiece", neighbors: list):
         ).reshape(-1, 2)
         pct = matching_pixels_pct(data_neighbor, data_piece, matrix_piece_to_neighbor_local,
                                    bbox_piece_in_neighbor)
+        if pct >= 0.5:
+            matched_neighbors.append(neighbor)
         if pct > best_pixel:
             best_pixel = pct
             best_matrix = M_new_world
 
     if best_matrix is None or best_pixel < 0.5:
-        return False
+        return []
 
     # Decompose new world matrix to update piece params
     tx, ty, rot, sc = decompose_affine(best_matrix)
@@ -422,4 +416,4 @@ def snap_piece_to_neighbors(piece: "PuzzlePiece", neighbors: list):
     piece.y = c2 * cx_l + d * cy_l + ty2
     piece.scale = math.sqrt(a * a + c2 * c2)
     piece.rotation_deg = math.degrees(math.atan2(c2, a))
-    return True
+    return matched_neighbors
