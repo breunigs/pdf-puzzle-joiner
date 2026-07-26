@@ -345,6 +345,7 @@ class PuzzlePieceItem(QGraphicsPixmapItem):
     def itemChange(self, change, value):
         if change == QGraphicsItem.GraphicsItemChange.ItemSelectedHasChanged:
             is_sel = bool(value)
+            self.setZValue(5 if is_sel else 0)
             in_group = self.scene_ref and self.scene_ref.has_snap_partners(self.piece)
             self.transform_handles.set_visible(is_sel and (not self.piece.is_locked or in_group))
             if self.scene_ref and hasattr(self.scene_ref, 'piece_selection_changed'):
