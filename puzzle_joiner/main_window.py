@@ -632,8 +632,6 @@ class MainWindow(QMainWindow):
         item = self.scene.piece_items.get(piece)
         if item:
             item.sync_from_piece()
-            if piece.is_locked:
-                item.setSelected(False)
         self.thumbnail_panel.update_piece(piece)
         self._update_snap_enabled()
 

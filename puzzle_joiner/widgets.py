@@ -841,6 +841,7 @@ class ThumbnailWidget(QWidget):
     def __init__(self, piece: PuzzlePiece):
         super().__init__()
         self.piece = piece
+        self._selected = False
         layout = QVBoxLayout(self)
         layout.setContentsMargins(2, 2, 2, 2)
         layout.setSpacing(1)
@@ -906,13 +907,15 @@ class ThumbnailWidget(QWidget):
             extra = " (!)"
         self.name_label.setText(name + extra)
 
-        # Border for locked
-        if piece.is_locked:
-            self.setStyleSheet("QWidget { border: 2px solid orange; }")
-        else:
-            self.setStyleSheet("QWidget { border: 2px solid transparent; }")
+        # Update border, preserving selection highlight
+        if not self._selected:
+            if piece.is_locked:
+                self.setStyleSheet("QWidget { border: 2px solid orange; }")
+            else:
+                self.setStyleSheet("QWidget { border: 2px solid transparent; }")
 
     def set_selected(self, selected: bool):
+        self._selected = selected
         if selected:
             self.setStyleSheet("QWidget { border: 2px solid #4488ff; background: #ddeeff; }")
         elif self.piece.is_locked:
