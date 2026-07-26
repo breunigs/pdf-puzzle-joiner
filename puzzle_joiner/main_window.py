@@ -32,7 +32,7 @@ from .widgets import (
     PuzzleScene, PuzzleView, ThumbnailPanel,
     PdfImportDialog, CutToolDialog,
 )
-from .undo import TransformCommand, SnapCommand, SnapAllCommand, LockCommand
+from .undo import TransformCommand, SnapCommand, SnapAllCommand, DeleteCommand, LockCommand
 
 
 class MainWindow(QMainWindow):
@@ -131,6 +131,11 @@ class MainWindow(QMainWindow):
         self.action_fit.setToolTip("Fit View (Ctrl+F)")
         self.action_fit.triggered.connect(self.on_fit_view)
         toolbar.addAction(self.action_fit)
+
+        action_delete = QAction("Delete", self)
+        action_delete.setShortcut(QKeySequence.StandardKey.Delete)
+        action_delete.triggered.connect(self._delete_selected_piece)
+        self.addAction(action_delete)
 
         # Thumbnail panel
         self.thumbnail_panel = ThumbnailPanel()
@@ -644,6 +649,25 @@ class MainWindow(QMainWindow):
         self.undo_stack.push(cmd)
         state = "locked" if piece.is_locked else "unlocked"
         self.status_bar.showMessage(f"Piece {state}.")
+
+    def _delete_selected_piece(self):
+        piece = self.scene.get_selected_piece()
+        if piece is None:
+            return
+        piece_index = self.pieces.index(piece)
+        snap_pairs = [(a, b) for a, b in self.scene.snap_pairs
+                       if a is piece or b is piece]
+        pid = id(piece)
+        snap_transforms = {k: v for k, v in self.scene.snap_transforms.items()
+                           if pid in k}
+        def post_delete():
+            self._update_snap_enabled()
+            self._auto_save_layout()
+        cmd = DeleteCommand(piece, piece_index, self.pieces, self.scene,
+                            self.thumbnail_panel, snap_pairs, snap_transforms,
+                            post_fn=post_delete)
+        self.undo_stack.push(cmd)
+        self.status_bar.showMessage("Piece deleted.")
 
     def _sync_piece(self, piece):
         """Sync piece visuals after undo/redo."""

@@ -120,6 +120,42 @@ class GroupTransformCommand(QUndoCommand):
             cmd.undo()
 
 
+class DeleteCommand(QUndoCommand):
+    """Undoable piece deletion."""
+
+    def __init__(self, piece, piece_index, pieces_list, scene, thumbnail_panel,
+                 snap_pairs, snap_transforms, post_fn=None):
+        super().__init__("Delete")
+        self.piece = piece
+        self.piece_index = piece_index
+        self.pieces_list = pieces_list
+        self.scene = scene
+        self.thumbnail_panel = thumbnail_panel
+        self.saved_snap_pairs = snap_pairs
+        self.saved_snap_transforms = snap_transforms
+        self.post_fn = post_fn
+
+    def redo(self):
+        self.pieces_list.remove(self.piece)
+        self.scene.remove_piece(self.piece)
+        self.thumbnail_panel.remove_piece(self.piece)
+        if self.post_fn:
+            self.post_fn()
+
+    def undo(self):
+        self.pieces_list.insert(self.piece_index, self.piece)
+        self.scene.add_piece(self.piece)
+        item = self.scene.piece_items.get(self.piece)
+        if item:
+            item.sync_from_piece()
+        self.thumbnail_panel.add_piece(self.piece)
+        for pair in self.saved_snap_pairs:
+            self.scene.snap_pairs.append(pair)
+        self.scene.snap_transforms.update(self.saved_snap_transforms)
+        if self.post_fn:
+            self.post_fn()
+
+
 class LockCommand(QUndoCommand):
     """Undoable lock/unlock toggle."""
 
