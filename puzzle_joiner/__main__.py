@@ -61,12 +61,14 @@ def main():
     args = [os.path.abspath(a) for a in sys.argv[1:]]
     if args:
         window._input_path = args[0]
-        # Check if PDF
-        if len(args) == 1 and args[0].lower().endswith(".pdf"):
-            QTimer.singleShot(100, lambda: window._import_pdf(args[0], None))
-        else:
-            # Treat as images
-            QTimer.singleShot(100, lambda: window._import_images(args))
+        pdfs = [a for a in args if a.lower().endswith(".pdf")]
+        images = [a for a in args if not a.lower().endswith(".pdf")]
+        def load_cli_files():
+            if pdfs:
+                window._open_pdfs(pdfs)
+            if images:
+                window._import_images(images)
+        QTimer.singleShot(100, load_cli_files)
 
     sys.exit(app.exec())
 

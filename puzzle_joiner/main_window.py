@@ -211,23 +211,34 @@ class MainWindow(QMainWindow):
     # --- PDF / Image loading ---
 
     def on_open_pdf(self):
-        pdf_path, _ = QFileDialog.getOpenFileName(
+        paths, _ = QFileDialog.getOpenFileNames(
             self, "Open PDF", "", "PDF files (*.pdf)"
         )
-        if not pdf_path:
+        if not paths:
             return
+        self._open_pdfs(paths)
 
-        page_count, page_sizes = pdf_page_info(pdf_path)
-        dlg = PdfImportDialog(pdf_path, page_count, page_sizes, self)
-        if dlg.exec() != QDialog.DialogCode.Accepted:
+    def _open_pdfs(self, pdf_paths: list):
+        if not pdf_paths:
             return
+        pdf_path = pdf_paths[0]
+        remaining = pdf_paths[1:]
 
-        pages = dlg.get_pages()
         if not self._input_path:
             self._input_path = pdf_path
-        self._import_pdf(pdf_path, pages)
 
-    def _import_pdf(self, pdf_path: str, pages):
+        page_count, page_sizes = pdf_page_info(pdf_path)
+        if page_count == 1:
+            pages = None
+        else:
+            dlg = PdfImportDialog(pdf_path, page_count, page_sizes, self)
+            if dlg.exec() != QDialog.DialogCode.Accepted:
+                self._open_pdfs(remaining)
+                return
+            pages = dlg.get_pages()
+        self._import_pdf(pdf_path, pages, then=remaining)
+
+    def _import_pdf(self, pdf_path: str, pages, then: list = None):
         if self._work_dir is None:
             self._work_dir = tempfile.mkdtemp(prefix="puzzle_joiner_")
 
@@ -308,7 +319,9 @@ class MainWindow(QMainWindow):
             name = os.path.basename(pdf_path)
             self.status_bar.showMessage(f"Loaded {n} pages from {name}")
             self.view.fit_all()
-            if not had_layout and len(self.pieces) >= 2:
+            if then:
+                self._open_pdfs(then)
+            elif not had_layout and len(self.pieces) >= 2:
                 self.on_auto_detect()
 
         cache_dir = _cache_dir_for_pdf(pdf_path)
