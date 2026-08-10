@@ -728,10 +728,10 @@ class MainWindow(QMainWindow):
         flat_path = f"{base}_flat{ext}"
 
         def task(progress):
-            progress.emit(5, "Exporting layered TIFF...")
-            export_layered_tiff(self.pieces, layered_path)
-            progress.emit(50, "Exporting flattened TIFF...")
+            progress.emit(5, "Exporting flattened TIFF...")
             export_flattened_tiff(self.pieces, flat_path)
+            progress.emit(50, "Exporting layered TIFF...")
+            export_layered_tiff(self.pieces, layered_path)
             progress.emit(95, "Done.")
             return (layered_path, flat_path)
 
