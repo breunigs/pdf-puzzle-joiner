@@ -9,8 +9,9 @@ from .model import PuzzlePiece
 
 
 def _layer_name(piece: PuzzlePiece) -> str:
-    """Derive a human-readable layer name."""
-    return piece.display_name or os.path.basename(piece.source_path)
+    """Derive a human-readable layer name (7-bit ASCII for TIFF compat)."""
+    name = piece.display_name or os.path.basename(piece.source_path)
+    return name.encode("ascii", errors="replace").decode("ascii")
 
 
 def _compute_optimal_rotation(pieces):

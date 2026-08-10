@@ -7,7 +7,7 @@ import os
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from puzzle_joiner.model import PuzzlePiece
-from puzzle_joiner.export import _compute_optimal_rotation, _export_affines, _union_bbox
+from puzzle_joiner.export import _compute_optimal_rotation, _export_affines, _layer_name, _union_bbox
 
 
 def _make_piece(w=100, h=80):
@@ -84,3 +84,25 @@ class TestOptimalRotation:
         p2.rotation_deg = 70
         angle, _, _ = _compute_optimal_rotation([p1, p2])
         assert -45 <= angle <= 45
+
+
+class TestLayerName:
+    def test_ascii_name_unchanged(self):
+        p = _make_piece()
+        p.display_name = "page_01"
+        assert _layer_name(p) == "page_01"
+
+    def test_non_ascii_replaced(self):
+        p = _make_piece()
+        p.display_name = "Übersicht Süd"
+        result = _layer_name(p)
+        assert result.isascii()
+        assert result == "?bersicht S?d"
+
+    def test_falls_back_to_source_path(self):
+        p = _make_piece()
+        p.display_name = ""
+        p.source_path = "/tmp/Ärger.png"
+        result = _layer_name(p)
+        assert result.isascii()
+        assert result == "?rger.png"
