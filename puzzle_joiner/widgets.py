@@ -14,20 +14,24 @@ from PySide6.QtWidgets import (
     QButtonGroup, QDialog, QDialogButtonBox, QLineEdit, QFormLayout,
     QMenu, QFrame, QGridLayout,
     QAbstractScrollArea, QMessageBox,
+    QSplitter, QComboBox, QTableWidget, QTableWidgetItem,
+    QHeaderView, QAbstractItemView,
 )
 from PySide6.QtCore import (
     Qt, QRectF, QPointF, QSizeF, QObject, Signal,
     QRunnable, QThreadPool, QEvent, QEasingCurve,
-    QVariantAnimation,
+    QVariantAnimation, QTimer,
 )
 from PySide6.QtGui import (
     QPixmap, QImage, QPainter, QPen, QColor, QBrush, QCursor,
     QFont, QTransform, QPainterPath,
 )
 
+from . import georef
 from .model import PuzzlePiece
 from .legend import anchor_pair
 from .priority import LOW_PRIO
+from .worker import Worker
 from .preprocessing import parse_page_range
 
 
@@ -2151,4 +2155,541 @@ class CutToolDialog(QDialog):
             self.view.lasso_item.remove_from_scene()
             self.view.lasso_item = None
         self.view.setFocus()
+        self.accept()
+
+
+# --- Georeferencing ---
+
+# Markers keep a fixed size on screen, so this is in device pixels.
+_GCP_MARKER_RADIUS = 6
+
+# How long a pan or zoom must settle before the OSM pane asks for new tiles.
+_OSM_SETTLE_MS = 180
+
+
+class GcpMarkerItem(QGraphicsItem):
+    """Numbered crosshair marking one end of a control point pair.
+
+    Ignores the view transform so it stays legible at any zoom — the OSM pane
+    ranges from the whole world to a single building.
+    """
+
+    def __init__(self, label: str, scene, pending: bool = False):
+        super().__init__()
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations, True)
+        self.setZValue(20)
+        self._label = label
+        self._pending = pending
+        self._highlighted = False
+        scene.addItem(self)
+
+    def set_highlighted(self, on: bool):
+        if on != self._highlighted:
+            self._highlighted = on
+            self.update()
+
+    def boundingRect(self) -> QRectF:
+        r = _GCP_MARKER_RADIUS + 3
+        return QRectF(-r, -r - 14, 2 * r + 34, 2 * r + 16)
+
+    def paint(self, painter, option, widget=None):
+        if self._pending:
+            color = QColor(255, 170, 0)
+        elif self._highlighted:
+            color = QColor(255, 60, 60)
+        else:
+            color = QColor(30, 110, 240)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        # White underlay, so the marker reads over dark map and dark scan alike.
+        for width, pen_color in ((3.0, QColor(255, 255, 255, 200)), (1.5, color)):
+            painter.setPen(QPen(pen_color, width))
+            r = _GCP_MARKER_RADIUS
+            painter.drawEllipse(QPointF(0, 0), r, r)
+            painter.drawLine(QPointF(-r - 3, 0), QPointF(-2, 0))
+            painter.drawLine(QPointF(2, 0), QPointF(r + 3, 0))
+            painter.drawLine(QPointF(0, -r - 3), QPointF(0, -2))
+            painter.drawLine(QPointF(0, 2), QPointF(0, r + 3))
+        font = painter.font()
+        font.setBold(True)
+        painter.setFont(font)
+        pos = QPointF(_GCP_MARKER_RADIUS + 5, -_GCP_MARKER_RADIUS - 2)
+        painter.setPen(QPen(QColor(255, 255, 255, 220), 3))
+        path = QPainterPath()
+        path.addText(pos, font, self._label)
+        painter.drawPath(path)
+        painter.fillPath(path, QBrush(color))
+
+
+class GcpView(QGraphicsView):
+    """Pan/zoom view that reports left clicks in scene coords.
+
+    Shared by both georeference panes so the two halves of a pair are placed
+    the same way: left-click marks, middle-drag pans, wheel zooms — the same
+    bindings the cut tool uses.
+    """
+
+    clicked = Signal(QPointF)
+    navigated = Signal()
+
+    def __init__(self, scene):
+        super().__init__(scene)
+        self.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        self.setDragMode(QGraphicsView.DragMode.NoDrag)
+        self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setCursor(QCursor(Qt.CursorShape.CrossCursor))
+        self._panning = False
+        self._pan_start = None
+
+    def wheelEvent(self, event):
+        factor = 1.25 if event.angleDelta().y() > 0 else 0.8
+        self.scale(factor, factor)
+        self.navigated.emit()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.MiddleButton:
+            self._panning = True
+            self._pan_start = event.pos()
+            self.setCursor(QCursor(Qt.CursorShape.ClosedHandCursor))
+            event.accept()
+        elif event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit(self.mapToScene(event.pos()))
+            event.accept()
+        else:
+            super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._panning:
+            delta = event.pos() - self._pan_start
+            self._pan_start = event.pos()
+            h = self.horizontalScrollBar()
+            v = self.verticalScrollBar()
+            h.setValue(h.value() - delta.x())
+            v.setValue(v.value() - delta.y())
+            event.accept()
+        else:
+            super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.MiddleButton and self._panning:
+            self._panning = False
+            self.setCursor(QCursor(Qt.CursorShape.CrossCursor))
+            self.navigated.emit()
+            event.accept()
+        else:
+            super().mouseReleaseEvent(event)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.navigated.emit()
+
+
+class OsmView(GcpView):
+    """The ground-truth pane: OpenStreetMap, rendered by QGIS on demand.
+
+    Scene coordinates are map metres with the northing negated, so that scene
+    y runs downwards like every other view here and like the rendered image
+    rows. Everything the user clicks is therefore already in map coordinates,
+    give or take that sign.
+
+    Tiles are fetched for the visible rectangle only, after navigation settles,
+    on a worker thread — a render reaches the network and must not block the
+    dialog. Each request carries a token so a slow one landing late cannot
+    overwrite the result of a newer one.
+    """
+
+    def __init__(self, parent=None):
+        scene = QGraphicsScene(parent)
+        world = georef.WORLD_EXTENT
+        scene.setSceneRect(QRectF(-world, -world, 2 * world, 2 * world))
+        super().__init__(scene)
+        self.setBackgroundBrush(QBrush(QColor(235, 235, 232)))
+        # The scene is the whole planet, so a scrollbar says nothing useful
+        # about where the view is; middle-drag is the way around.
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._tiles = QGraphicsPixmapItem()
+        self._tiles.setZValue(-10)
+        self._tiles.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
+        scene.addItem(self._tiles)
+        self._token = 0
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.setInterval(_OSM_SETTLE_MS)
+        self._timer.timeout.connect(self._render)
+        self.navigated.connect(self._timer.start)
+        # Every scroll ends up here, however it was made — middle-drag, arrow
+        # keys, a trackpad. Watching the bars rather than the gestures is what
+        # stops the view sliding off the tiles it was given.
+        for bar in (self.horizontalScrollBar(), self.verticalScrollBar()):
+            # Discard the signal's value — passed on, it becomes the interval.
+            bar.valueChanged.connect(lambda _value: self._timer.start())
+
+    @staticmethod
+    def scene_to_map(pos: QPointF):
+        return pos.x(), -pos.y()
+
+    @staticmethod
+    def map_to_scene(map_x, map_y) -> QPointF:
+        return QPointF(map_x, -map_y)
+
+    def show_map_rect(self, min_x, min_y, max_x, max_y):
+        """Frame a map-coordinate rectangle exactly as asked.
+
+        No margin is added here: callers pad in metres, which is the unit they
+        think in, and a proportional margin on top would make that padding mean
+        something different at every zoom. Keeping the aspect ratio still shows
+        more than asked on the roomier axis — the rectangle is a minimum.
+        """
+        rect = QRectF(QPointF(min_x, -max_y), QPointF(max_x, -min_y))
+        if rect.width() <= 0 or rect.height() <= 0:
+            rect.adjust(-georef.POINT_MARGIN, -georef.POINT_MARGIN,
+                        georef.POINT_MARGIN, georef.POINT_MARGIN)
+        self.fitInView(rect, Qt.AspectRatioMode.KeepAspectRatio)
+        self._timer.start()
+
+    def _render(self):
+        viewport = self.viewport().rect()
+        if viewport.isEmpty() or not georef.ready():
+            return
+        rect = self.mapToScene(viewport).boundingRect()
+        self._token += 1
+        token = self._token
+        extent = (rect.left(), -rect.bottom(), rect.right(), -rect.top())
+        width, height = viewport.width(), viewport.height()
+
+        def task(progress):
+            return georef.render_osm(extent, width, height)
+
+        worker = Worker(task)
+        worker.signals.finished.connect(
+            lambda arr: self._apply_tiles(token, arr, rect))
+        # A failed render leaves the previous tiles up; the alternative is a
+        # blank pane every time the network hiccups mid-pan.
+        worker.signals.error.connect(lambda _msg: None)
+        QThreadPool.globalInstance().start(worker)
+
+    def _apply_tiles(self, token, arr, rect: QRectF):
+        if token != self._token or arr is None or arr.size == 0:
+            return
+        arr = np.ascontiguousarray(arr)
+        img = QImage(arr.data, arr.shape[1], arr.shape[0], arr.strides[0],
+                     QImage.Format.Format_RGBA8888)
+        self._tiles.setPixmap(QPixmap.fromImage(img.copy()))
+        self._tiles.setPos(rect.topLeft())
+        # The render is one device pixel per viewport pixel; scale it back into
+        # scene units so it lands exactly on the rectangle it was asked for.
+        self._tiles.setScale(rect.width() / max(1, arr.shape[1]))
+
+
+class GeorefDialog(QDialog):
+    """Tie one page to the world by pairing points on it with points on OSM.
+
+    Georeferencing is per page because that is where features are recognisable;
+    the export pools every page's points into one warp of the assembled canvas.
+
+    The page is shown uncropped, like the cut tool, so a crisp landmark just
+    outside the crop can still be used — the export keeps such points (see
+    `export.canvas_gcps`). The page's crop is outlined as a reminder of which
+    part of what is on screen actually survives to the output.
+    """
+
+    _HINT = ("Click a point on the page, then the same place on the map. "
+             "Middle-drag to pan, wheel to zoom.")
+    _HINT_PENDING = "Now click the same place on the map (Esc to cancel)."
+
+    def __init__(self, piece: PuzzlePiece, pieces: list = None,
+                 method: str = georef.DEFAULT_METHOD, parent=None):
+        super().__init__(parent)
+        self.piece = piece
+        self.setWindowTitle(f"Georeference - {os.path.basename(piece.source_path)}")
+        self.setMinimumSize(1000, 700)
+
+        # Edited here and read back by the caller; the piece is never touched.
+        self._gcps = [tuple(g) for g in piece.gcps]
+        self._pending = None  # page point waiting for its map point
+        self.result_gcps = None
+        self.result_method = method if method in georef.METHODS else georef.DEFAULT_METHOD
+
+        self._page_markers = []
+        self._osm_markers = []
+
+        layout = QVBoxLayout(self)
+        self.splitter = QSplitter(self._default_orientation())
+        self.page_view = self._build_page_view()
+        self.osm_view = OsmView(self)
+        self.splitter.addWidget(self.page_view)
+        self.splitter.addWidget(self.osm_view)
+        self.splitter.setSizes([500, 500])
+        layout.addWidget(self.splitter, 1)
+
+        self.page_view.clicked.connect(self._on_page_clicked)
+        self.osm_view.clicked.connect(self._on_map_clicked)
+
+        layout.addLayout(self._build_controls())
+        layout.addWidget(self._build_table())
+        layout.addLayout(self._build_buttons())
+
+        self.hint = QLabel()
+        self.hint.setWordWrap(True)
+        layout.addWidget(self.hint)
+
+        self._initial_map_rect = self._initial_map_bounds(pieces or [piece])
+        self._fitted = False
+        self._refresh()
+        self.page_view.setFocus()
+
+    def showEvent(self, event):
+        """Frame both panes once the dialog has the size it will actually have.
+
+        Fitting in the constructor fits to the widgets' provisional geometry,
+        which leaves the page floating in a half-empty pane and the map on the
+        wrong extent. Deferring past layout is what makes both land right.
+        """
+        super().showEvent(event)
+        if not self._fitted:
+            self._fitted = True
+            QTimer.singleShot(0, self._fit_panes)
+
+    def _fit_panes(self):
+        self.page_view.fitInView(self.page_view.scene().sceneRect(),
+                                 Qt.AspectRatioMode.KeepAspectRatio)
+        self.osm_view.show_map_rect(*self._initial_map_rect)
+
+    # --- construction ---
+
+    def _default_orientation(self):
+        """Split across the page's long axis, so both panes stay roomy.
+
+        A tall page leaves width to spare, so the panes go side by side; a wide
+        one leaves height, so they stack.
+        """
+        h, w = self.piece.image.shape[:2]
+        return (Qt.Orientation.Horizontal if h >= w
+                else Qt.Orientation.Vertical)
+
+    def _build_page_view(self) -> GcpView:
+        scene = QGraphicsScene(self)
+        img = self.piece.image
+        h, w = img.shape[:2]
+        rgba = cv2.cvtColor(img, cv2.COLOR_BGRA2RGBA)
+        if self.piece._base_alpha is not None:
+            # Unmasked, so a point can be put on ground a lasso cut away.
+            rgba[:, :, 3] = self.piece._base_alpha
+        qimg = QImage(rgba.data, rgba.shape[1], rgba.shape[0], rgba.strides[0],
+                      QImage.Format.Format_RGBA8888)
+        scene.addItem(QGraphicsPixmapItem(QPixmap.fromImage(qimg.copy())))
+        scene.setSceneRect(QRectF(0, 0, w, h))
+        if self.piece.crop_rect is not None:
+            cx, cy, cw, ch = self.piece.crop_rect
+            outline = QGraphicsRectItem(QRectF(cx, cy, cw, ch))
+            pen = QPen(QColor(80, 200, 120), 2)
+            pen.setStyle(Qt.PenStyle.DashLine)
+            pen.setCosmetic(True)
+            outline.setPen(pen)
+            outline.setBrush(QBrush(Qt.BrushStyle.NoBrush))
+            outline.setZValue(4)
+            scene.addItem(outline)
+        view = GcpView(scene)
+        view.fitInView(scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+        return view
+
+    def _build_controls(self) -> QHBoxLayout:
+        row = QHBoxLayout()
+        self.orientation_btn = QPushButton()
+        self.orientation_btn.setAutoDefault(False)
+        self.orientation_btn.clicked.connect(self._toggle_orientation)
+        row.addWidget(self.orientation_btn)
+        row.addSpacing(16)
+        row.addWidget(QLabel("Transform:"))
+        self.method_combo = QComboBox()
+        self.method_combo.addItems(georef.METHODS)
+        self.method_combo.setCurrentText(self.result_method)
+        self.method_combo.currentTextChanged.connect(self._on_method_changed)
+        row.addWidget(self.method_combo)
+        row.addStretch(1)
+        self.fit_label = QLabel()
+        row.addWidget(self.fit_label)
+        return row
+
+    def _build_table(self) -> QTableWidget:
+        self.table = QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(
+            ["#", "Page x, y", "Map x, y", "Residual (m)"])
+        self.table.verticalHeader().hide()
+        self.table.setMaximumHeight(170)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        for col in (1, 2, 3):
+            header.setSectionResizeMode(col, QHeaderView.ResizeMode.Stretch)
+        self.table.itemSelectionChanged.connect(self._on_row_selected)
+        return self.table
+
+    def _build_buttons(self) -> QHBoxLayout:
+        row = QHBoxLayout()
+        self.delete_btn = QPushButton("Delete Point")
+        self.apply_btn = QPushButton("Apply")
+        self.cancel_btn = QPushButton("Cancel")
+        self.delete_btn.clicked.connect(self._delete_selected)
+        self.apply_btn.clicked.connect(self._apply)
+        self.cancel_btn.clicked.connect(self.reject)
+        for btn in (self.delete_btn, self.apply_btn, self.cancel_btn):
+            btn.setAutoDefault(False)
+            row.addWidget(btn)
+        return row
+
+    def _initial_map_bounds(self, pieces: list):
+        """Open the map where there is already work, rather than on the world.
+
+        This page's own points first; failing that any other page's, since the
+        pages of one document are usually neighbours. A single point is enough:
+        its box has no size, so `POINT_MARGIN` is what sets the zoom, and the
+        same margin keeps a box of many points clear of the pane edges.
+        """
+        for candidates in (self._gcps,
+                           [g for p in pieces for g in p.gcps]):
+            if candidates:
+                xs = [g[2] for g in candidates]
+                ys = [g[3] for g in candidates]
+                margin = georef.POINT_MARGIN
+                return (min(xs) - margin, min(ys) - margin,
+                        max(xs) + margin, max(ys) + margin)
+        return georef.DEFAULT_MAP_RECT
+
+    # --- interaction ---
+
+    def _toggle_orientation(self):
+        self.splitter.setOrientation(
+            Qt.Orientation.Vertical
+            if self.splitter.orientation() == Qt.Orientation.Horizontal
+            else Qt.Orientation.Horizontal)
+        self.splitter.setSizes([500, 500])
+        self._update_orientation_button()
+
+    def _update_orientation_button(self):
+        side_by_side = self.splitter.orientation() == Qt.Orientation.Horizontal
+        self.orientation_btn.setText(
+            "Stack top/bottom" if side_by_side else "Place left/right")
+
+    def _on_method_changed(self, method: str):
+        self.result_method = method
+        self._refresh()
+
+    def _on_page_clicked(self, pos: QPointF):
+        self._pending = (pos.x(), pos.y())
+        self._refresh()
+
+    def _on_map_clicked(self, pos: QPointF):
+        if self._pending is None:
+            self._set_hint(self._HINT)
+            return
+        map_x, map_y = OsmView.scene_to_map(pos)
+        self._gcps.append((self._pending[0], self._pending[1], map_x, map_y))
+        self._pending = None
+        self._refresh()
+        self.table.selectRow(len(self._gcps) - 1)
+
+    def _delete_selected(self):
+        row = self.table.currentRow()
+        if 0 <= row < len(self._gcps):
+            del self._gcps[row]
+            self._refresh()
+
+    def _on_row_selected(self):
+        row = self.table.currentRow()
+        for index, markers in enumerate(zip(self._page_markers, self._osm_markers)):
+            for marker in markers:
+                marker.set_highlighted(index == row)
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Escape and self._pending is not None:
+            # Esc drops a half-made pair before it drops the dialog.
+            self._pending = None
+            self._refresh()
+            event.accept()
+            return
+        if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+            self._delete_selected()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    # --- refresh ---
+
+    def _refresh(self):
+        self._rebuild_markers()
+        self._rebuild_table()
+        self._update_orientation_button()
+        self._set_hint(self._HINT_PENDING if self._pending else self._HINT)
+
+    def _rebuild_markers(self):
+        """Rebuild every marker: deleting a point renumbers the ones after it."""
+        for marker in self._page_markers + self._osm_markers:
+            marker.scene().removeItem(marker)
+        self._page_markers = []
+        self._osm_markers = []
+        page_scene = self.page_view.scene()
+        osm_scene = self.osm_view.scene()
+        for index, (img_x, img_y, map_x, map_y) in enumerate(self._gcps, start=1):
+            page_marker = GcpMarkerItem(str(index), page_scene)
+            page_marker.setPos(QPointF(img_x, img_y))
+            osm_marker = GcpMarkerItem(str(index), osm_scene)
+            osm_marker.setPos(OsmView.map_to_scene(map_x, map_y))
+            self._page_markers.append(page_marker)
+            self._osm_markers.append(osm_marker)
+        if self._pending is not None:
+            pending = GcpMarkerItem(str(len(self._gcps) + 1), page_scene, pending=True)
+            pending.setPos(QPointF(*self._pending))
+            self._page_markers.append(pending)
+            # Keeps the two lists the same length, so `_on_row_selected` can zip
+            # them without the pending marker shifting the pairing.
+            self._osm_markers.append(GcpMarkerItem("", osm_scene, pending=True))
+            self._osm_markers[-1].setVisible(False)
+
+    def _rebuild_table(self):
+        errors = self._residuals()
+        self.table.setRowCount(len(self._gcps))
+        for row, (img_x, img_y, map_x, map_y) in enumerate(self._gcps):
+            cells = [
+                str(row + 1),
+                f"{img_x:.0f}, {img_y:.0f}",
+                f"{map_x:.1f}, {map_y:.1f}",
+                "-" if errors is None else f"{errors[row]:.1f}",
+            ]
+            for col, text in enumerate(cells):
+                self.table.setItem(row, col, QTableWidgetItem(text))
+        self._update_fit_label(errors)
+
+    def _residuals(self):
+        try:
+            return georef.residuals(self._gcps, self.result_method)
+        except Exception:
+            return None
+
+    def _update_fit_label(self, errors):
+        needed = self._minimum_points()
+        if errors is None:
+            missing = max(0, needed - len(self._gcps))
+            self.fit_label.setText(
+                f"{len(self._gcps)} points - {missing} more needed"
+                if missing else f"{len(self._gcps)} points - no fit")
+            return
+        rms = float(np.sqrt(np.mean(np.square(errors)))) if errors else 0.0
+        self.fit_label.setText(f"{len(self._gcps)} points - RMS {rms:.1f} m")
+
+    def _minimum_points(self) -> int:
+        try:
+            return georef.minimum_gcp_count(self.result_method)
+        except Exception:
+            return 2
+
+    def _set_hint(self, text: str):
+        self.hint.setText(text)
+
+    def _apply(self):
+        self.result_gcps = list(self._gcps)
         self.accept()

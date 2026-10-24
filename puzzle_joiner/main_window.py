@@ -24,19 +24,21 @@ from .preprocessing import (
 from .cache import (
     _cache_dir_for_pdf, _cached_page_path, _cached_autocrop_path,
     _load_cached_page, save_layout, load_layout, load_legends, _images_cache_dir,
+    load_georef_method,
 )
 from .matching import auto_detect_placements, snap_piece_to_neighbors
 from .export import export_layered_tiff, export_flattened_tiff
 from .legend import make_legend_piece, clone_legend_piece
+from . import georef
 from .worker import Worker
 from .priority import _set_low_priority
 from .widgets import (
     PuzzleScene, PuzzleView, ThumbnailPanel,
-    PdfImportDialog, CutToolDialog,
+    PdfImportDialog, CutToolDialog, GeorefDialog,
 )
 from .undo import (
     TransformCommand, SnapCommand, SnapAllCommand, DeleteCommand, LockCommand,
-    CropCommand, AddPieceCommand,
+    CropCommand, AddPieceCommand, GeorefCommand,
 )
 
 
@@ -50,6 +52,8 @@ class MainWindow(QMainWindow):
         self._source_files: list = []  # original filenames for display_name logic
         self._work_dir = None
         self._layout_dir: Optional[str] = None
+        # One georeference method per document; see `cache.save_layout`.
+        self._georef_method = georef.DEFAULT_METHOD
         self._thread_pool = QThreadPool.globalInstance()
         self.undo_stack = QUndoStack(self)
         self.undo_stack.indexChanged.connect(self._auto_save_layout)
@@ -116,12 +120,19 @@ class MainWindow(QMainWindow):
         self.action_cut.triggered.connect(self.on_cut)
         toolbar.addAction(self.action_cut)
 
-        self.action_add_legend = QAction(f"Add Leg{U}end", self)
-        self.action_add_legend.setShortcut(QKeySequence("Ctrl+G"))
+        self.action_add_legend = QAction(f"A{U}dd Legend", self)
+        self.action_add_legend.setShortcut(QKeySequence("Ctrl+A"))
         self.action_add_legend.setToolTip(
-            "Cut a legend out of the selected page (Ctrl+G)")
+            "Cut a legend out of the selected page (Ctrl+A)")
         self.action_add_legend.triggered.connect(self.on_add_legend)
         toolbar.addAction(self.action_add_legend)
+
+        self.action_georef = QAction(f"G{U}eoreference", self)
+        self.action_georef.setShortcut(QKeySequence("Ctrl+G"))
+        self.action_georef.setToolTip(
+            "Tie the selected page to OpenStreetMap (Ctrl+G)")
+        self.action_georef.triggered.connect(self.on_georeference)
+        toolbar.addAction(self.action_georef)
 
         self.action_lock = QAction(f"L{U}ock/Unlock", self)
         self.action_lock.setShortcut(QKeySequence("Ctrl+L"))
@@ -720,6 +731,37 @@ class MainWindow(QMainWindow):
         self.thumbnail_panel.update_piece(piece)
         self._auto_save_layout()
 
+    # --- Georeferencing ---
+
+    def on_georeference(self):
+        if not georef.available():
+            self.status_bar.showMessage(
+                "Georeferencing needs QGIS; no QGIS Python bindings were found.")
+            return
+        piece = self.scene.get_selected_piece()
+        if piece is None:
+            self.status_bar.showMessage("Select the page to georeference.")
+            return
+        if piece.is_legend:
+            self.status_bar.showMessage("Legends carry no geography — pick a page.")
+            return
+        georef.initialize()
+        dlg = GeorefDialog(piece, self._map_pieces(), self._georef_method, self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        if dlg.result_method != self._georef_method:
+            self._georef_method = dlg.result_method
+            self._auto_save_layout()
+        if list(dlg.result_gcps) == list(piece.gcps):
+            return
+        # No sync_fn: control points change nothing that is drawn on the canvas,
+        # and the undo stack already triggers the layout save.
+        self.undo_stack.push(GeorefCommand(piece, piece.gcps, dlg.result_gcps))
+        count = len(dlg.result_gcps)
+        self.status_bar.showMessage(
+            f"{count} control point{'' if count == 1 else 's'} on "
+            f"{piece.display_name or os.path.basename(piece.source_path)}.")
+
     # --- Legends ---
 
     def on_add_legend(self):
@@ -912,11 +954,14 @@ class MainWindow(QMainWindow):
 
     def _auto_save_layout(self):
         if self._layout_dir and self.pieces:
-            save_layout(self._layout_dir, self.pieces, self.scene.snap_pairs)
+            save_layout(self._layout_dir, self.pieces, self.scene.snap_pairs,
+                        self._georef_method)
 
     def _restore_layout(self) -> bool:
         """Restore piece positions and snap pairs from cache. Returns True if applied."""
         self._restore_legends()
+        self._georef_method = (load_georef_method(self._layout_dir)
+                               or georef.DEFAULT_METHOD)
         applied, raw_pairs = load_layout(self._layout_dir, self.pieces)
         if applied:
             for piece in self.pieces:

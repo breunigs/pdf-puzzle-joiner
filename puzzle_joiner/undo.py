@@ -240,3 +240,25 @@ class LockCommand(QUndoCommand):
         self.piece.is_locked = not self.piece.is_locked
         if self.sync_fn:
             self.sync_fn(self.piece)
+
+
+class GeorefCommand(QUndoCommand):
+    """Undoable replacement of a page's ground control points."""
+
+    def __init__(self, piece, old_gcps, new_gcps, sync_fn=None):
+        super().__init__("Georeference")
+        self.piece = piece
+        self.old_gcps = list(old_gcps)
+        self.new_gcps = list(new_gcps)
+        self.sync_fn = sync_fn
+
+    def _set(self, gcps):
+        self.piece.gcps = list(gcps)
+        if self.sync_fn:
+            self.sync_fn(self.piece)
+
+    def redo(self):
+        self._set(self.new_gcps)
+
+    def undo(self):
+        self._set(self.old_gcps)

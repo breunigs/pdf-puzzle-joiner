@@ -58,8 +58,12 @@ def _layout_path(cache_dir: str) -> str:
     return os.path.join(cache_dir, "layout.json")
 
 
-def save_layout(cache_dir: str, pieces, snap_pairs=None) -> None:
-    """Save piece layout state and snap pairs to cache dir."""
+def save_layout(cache_dir: str, pieces, snap_pairs=None, georef_method=None) -> None:
+    """Save piece layout state, snap pairs and georeferencing to cache dir.
+
+    The cache dir is per input PDF, so the georeference method stored here is
+    too — one document's pages are georeferenced the same way.
+    """
     if not cache_dir:
         return
     entries = []
@@ -76,6 +80,8 @@ def save_layout(cache_dir: str, pieces, snap_pairs=None) -> None:
             "lasso_poly": ([list(p) for p in piece.lasso_poly]
                            if piece.lasso_poly is not None else None),
         }
+        if piece.gcps:
+            entry["gcps"] = [list(g) for g in piece.gcps]
         if piece.is_legend:
             # Enough to cut the instance out of its page again on the next load.
             entry["legend"] = {
@@ -86,6 +92,8 @@ def save_layout(cache_dir: str, pieces, snap_pairs=None) -> None:
             }
         entries.append(entry)
     data = {"pieces": entries}
+    if georef_method:
+        data["georef_method"] = georef_method
     if snap_pairs:
         data["snap_pairs"] = [
             [a.layout_key(), b.layout_key()] for a, b in snap_pairs
@@ -95,22 +103,32 @@ def save_layout(cache_dir: str, pieces, snap_pairs=None) -> None:
         json.dump(data, f, indent=1)
 
 
-def _read_layout(cache_dir: str):
-    """Read a layout file as (entries, snap_pairs); ([], []) when there is none.
+def _read_raw(cache_dir: str) -> dict:
+    """Layout file as a dict; empty when there is none.
 
-    Handles both the old format (a flat list) and the current one (a dict with
-    pieces and snap_pairs).
+    Handles both the old format (a flat list of pieces) and the current one.
     """
     if not cache_dir:
-        return [], []
+        return {}
     path = _layout_path(cache_dir)
     if not os.path.exists(path):
-        return [], []
+        return {}
     with open(path, "r") as f:
         raw = json.load(f)
     if isinstance(raw, list):
-        return raw, []
+        return {"pieces": raw}
+    return raw
+
+
+def _read_layout(cache_dir: str):
+    """Read a layout file as (entries, snap_pairs); ([], []) when there is none."""
+    raw = _read_raw(cache_dir)
     return raw.get("pieces", []), raw.get("snap_pairs", [])
+
+
+def load_georef_method(cache_dir: str):
+    """The georeference method saved for this document, or None if unset."""
+    return _read_raw(cache_dir).get("georef_method")
 
 
 def load_legends(cache_dir: str) -> list:
@@ -148,6 +166,7 @@ def load_layout(cache_dir: str, pieces):
         piece.scale = e["scale"]
         piece.is_matched = e.get("is_matched", False)
         piece.is_locked = e.get("is_locked", False)
+        piece.gcps = [tuple(g) for g in e.get("gcps", [])]
         saved_crop = e.get("crop_rect")
         if saved_crop is not None:
             # A lasso always carries its bounding box as the crop rect, so it is

@@ -9,7 +9,7 @@ Python/Qt desktop app for assembling puzzle pieces from scanned PDFs or images. 
 - **OpenCV** for image processing and feature matching
 - **NumPy**, **tifffile** for array manipulation and TIFF export
 - **Poppler** (`pdfseparate`, `pdftocairo`, `pdfinfo`) and **ImageMagick** (`convert`) for PDF handling
-- **System QGIS** (Qt5/PyQt5, optional) for OSM tiles and GCP fitting. The georeferenced export needs no GDAL — it writes the GeoTIFF tags itself. Both are system packages, not wheels; see `georef.py` for how a Qt5 library runs inside this Qt6 app.
+- **System QGIS** (Qt5/PyQt5, optional) for the OSM basemap and the GCP fitting behind the georeference dialog. Both are system packages, not wheels; see `georef.py` for how a Qt5 library runs inside this Qt6 app.
 
 ## File Structure
 
@@ -25,8 +25,9 @@ puzzle_joiner/
   cache.py                 # Page cache (~/.cache/puzzle-joiner/{md5}/)
   matching.py              # ORB features, pairwise matching, auto-detect, snap
   legend.py                # Legend instances, export anchor + uprighting math
+  georef.py                # QGIS bridge: OSM tile rendering + GCP transform fitting
   export.py                # Layered + flattened TIFF export
-  undo.py                  # QUndoCommand subclasses (TransformCommand, SnapCommand, CropCommand, LockCommand)
+  undo.py                  # QUndoCommand subclasses (TransformCommand, SnapCommand, CropCommand, LockCommand, GeorefCommand)
   worker.py                # WorkerSignals, Worker (QRunnable pattern)
   widgets.py               # All Qt widgets (handles, piece items, scene, view, thumbnails, dialogs)
   main_window.py           # MainWindow (toolbar, import flow, action handlers)
@@ -40,6 +41,7 @@ tests/
   test_lasso.py            # lasso crop: alpha masking, polygon editor, cut-tool undo
   test_legend.py           # legends: cutting, anchor/upright math, gating, persistence
   test_export.py           # export: rotation, band streaming, lasso + uncropped canvas
+  test_georef.py           # georeferencing: canvas GCP mapping, fit, persistence, dialog
   test_boot.py             # smoke test: MainWindow constructs, legend add/undo/restore
 ```
 
@@ -47,6 +49,8 @@ tests/
 
 ### `model.py`
 `PuzzlePiece` — holds full-res BGRA image, display pixmap (max 2048px), thumbnail (256px), and transform state (`x, y, rotation_deg, scale, crop_rect`, `lasso_poly`). Key methods: `get_affine_matrix()`, `get_bounding_box()`, `get_cropped_image()`.
+
+`gcps` holds the page's ground control points as `[(img_x, img_y, map_x, map_y), ...]`. The image coords are **full-image** ones — the same space as `crop_rect` and `lasso_poly`, and the space `GeorefDialog` shows — so a point stays put when the crop changes. See `georef.py`.
 
 `layout_key()` is the piece's identity for layout persistence. Pages key on their source basename; legend instances share their page's source path, so they append `#legend{n}` to be told apart from the page and from each other. See `legend.py` for the rest of the legend state.
 
@@ -73,6 +77,15 @@ Note the legend body *does* swing when it is uprighted; only the anchor is pinne
 
 **Separation.** Because the swing changes a legend's footprint, a legend clear of everything on the canvas can land on the map or on a neighbour once squared up — the pivots are per legend, so nothing about the rotation keeps two of them apart. `separate_legends` resolves that afterwards: legends are processed nearest-the-map first (ties by instance number, so the result does not depend on list order), and each is translated the shortest distance that clears the map and every legend already placed. Candidate directions are straight out from the map plus both sideways; reversing back towards the map is only allowed for a legend that *starts* on top of it, where the nearest edge is the way out. The distance along a direction is exact, not iterative: `moving + t*d` meets an obstacle exactly when `t*d` is inside the Minkowski difference, which is convex, so `_ray_overlap_interval` gets the overlapping `t` range by clipping the ray against its edges, and `_clear_distance` sweeps those ranges until `t` is outside all of them. A nudge is a pure translation, so it cannot reintroduce rotation.
 
+### `georef.py`
+Borrows the **system QGIS** install (`/usr/lib/python3/dist-packages`, appended to `sys.path` so the app's own numpy still wins). QGIS is a package, not a wheel, so it may be absent — `available()` is the gate every caller checks, and the Georeference action just reports it is missing.
+
+**Two Qt versions, one process.** QGIS is Qt5/PyQt5 and this app is Qt6/PySide6. They coexist because Qt versions its symbols, on one condition: `QgsApplication([], False)` — GUI disabled, so QGIS never loads a Qt5 platform plugin and never contests the event loop. PySide6 owns all the windowing. Hence `qgis.gui` is unusable and nothing here returns a Qt object: pixels leave as numpy arrays, points as tuples, so a Qt5 wrapper can never reach a PySide6 call. `initialize()` must run on the GUI thread; `ready()` guards the renders, which would crash rather than fail without it. `render_osm` is safe off-thread — the job runs its own threads and `waitForFinished` needs no event loop of ours.
+
+What is borrowed is the tile stack (fetching, caching, zoom choice, reprojection, labels) and `QgsGcpTransformerInterface`. Map coordinates are EPSG:3857 throughout, which is what the tiles render in and what the user's clicks are measured in, so the warp reprojects nothing.
+
+**The row flip.** Image rows run down and northings run up, so the mapping contains a reflection, which a similarity transform cannot express — given raw rows, Helmert approximates the flip by rotating the map 45°. QGIS wants the reflection taken out of the points it is *fitted* on but puts it back itself when *transforming*, so `fit()` negates the row on input and not on query. That asymmetry was measured, not deduced: of the four sign combinations only this one reproduces a known north-up mapping exactly (`test_georef.TestFit`). Linear survives either way — having no rotation to protect, it absorbs the flip as a negative y scale.
+
 ### `export.py`
 - **Layered TIFF**: each piece as a separate BigTIFF layer (deflate, 1024x1024 tiles).
 - **Flattened TIFF**: alpha-composite all pieces onto single canvas.
@@ -90,10 +103,14 @@ Note the legend body *does* swing when it is uprighted; only the anchor is pinne
 - `PuzzleScene.update_legend_anchor`: dashed marker showing the point the export will pivot a selected legend on. `get_neighbors` and `get_drag_group` both exclude legends, so no snap can reach them and no lock group can drag them.
 - `PdfImportDialog`: page selection grid with async thumbnail generation.
 - `CutToolDialog`: crop region editor showing the full uncropped image, unmasked so an existing lasso can be pushed outwards. Two tools: Rectangle (`CropRectItem`) and Lasso (`LassoItem`).
+- `GeorefDialog`: page beside OSM, click one then the other to pair a control point. The page is shown **uncropped** like the cut tool (its crop outlined dashed, as a reminder of what survives), so a landmark just outside the crop is still usable. The splitter follows the page's long axis — a tall page leaves width to spare so the panes go side by side, a wide one stacks them — and the toggle flips it. Transform choice (Helmert default, Linear) lives here and is saved per document. Both panes are fitted in `showEvent`, not the constructor, where the widgets still have provisional geometry.
+- `GcpView` / `OsmView` / `GcpMarkerItem`: shared pan/zoom (middle-drag, wheel) so both halves of a pair are placed the same way. `OsmView` scene coords are map metres with the **northing negated**, so scene y runs down like every other view and like the rendered rows; `scene_to_map` is therefore the only conversion the dialog needs. Tiles are fetched for the visible rect only, debounced, on a worker thread, each request carrying a token so a slow one landing late cannot overwrite a newer one. Refresh is driven off the **scrollbars**, not the gestures, so any scroll route (keys, trackpad) is covered. Markers ignore the view transform, since the map pane ranges from the whole world to one building.
 - `LassoItem`, `LassoVertexItem`: GIMP-style piecewise-linear selection — click to place points, close by clicking the first point / double-click / Enter, Backspace to undo a point, drag a vertex to correct it, drag a midpoint knob to insert one, right-click to delete. `CropView` owns all the hit-testing and dragging, by index: moving a point can rebuild the handle list, so no handle may hold the mouse grab.
 
 ### `main_window.py`
-Toolbar workflow: Open PDF/Images → Auto-Detect → Snap → Cut → Add Legend → Lock → Export. Manages piece list, threading, progress dialogs.
+Toolbar workflow: Open PDF/Images → Auto-Detect → Snap → Cut → Add Legend → Georeference → Lock → Export. Manages piece list, threading, progress dialogs.
+
+**Georeferencing.** `on_georeference` opens `GeorefDialog` on the selected page (legends carry no geography and are refused) and pushes a `GeorefCommand`; control points draw nothing on the canvas, so it needs no `sync_fn`. The method is one per document, kept in `self._georef_method`, saved into `layout.json` — whose cache dir is already per input PDF — and read back by `load_georef_method`. `on_export` starts QGIS on the GUI thread before the export worker begins, since the fit runs on that worker.
 
 **Legends.** `_map_pieces()` is the matching set — Auto-Detect and Snap both run on it, so legends are never matched or moved by them (Auto-Detect leaves them exactly where they are and says so in the status bar). `add_legend_from_page` opens `CutToolDialog` in `mode="legend"`, `duplicate_legend` clones one, and both go on the undo stack via `AddPieceCommand`. `_restore_legends` re-cuts saved legends before `load_layout` positions them, skipping any whose page is not loaded.
 
@@ -110,6 +127,8 @@ PDF/Images → convert & clean (parallel, low-prio) → cache → PuzzlePiece li
   → Manual adjust / Snap / Cut → Export TIFF
                               ↘ Add Legend (region off any page, excluded from
                                 matching) → placed by hand → uprighted on export
+                              ↘ Georeference (per page, against OSM) → control
+                                points saved with the layout
 ```
 
 ## Running

@@ -36,6 +36,12 @@ class PuzzlePiece:
         self.legend_source_key: str = ""
         self.legend_rect: Optional[tuple] = None
         self.legend_instance: int = 0
+        # Ground control points tying this page to the world, as
+        # [(img_x, img_y, map_x, map_y), ...]. The image coords are full-image
+        # ones — the same space as `crop_rect` and `lasso_poly`, and the space
+        # the georeference dialog shows — so a point stays put when the crop
+        # changes. The map coords are metres in `georef.MAP_CRS`.
+        self.gcps: list = []
 
     def layout_key(self) -> str:
         """Stable identity for layout persistence.
