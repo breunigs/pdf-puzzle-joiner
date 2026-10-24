@@ -108,6 +108,27 @@ def export_layered_tiff(pieces: list, output_path: str):
             )
 
 
+def _available_memory() -> int:
+    """Bytes of RAM usable without swapping, counting reclaimable page cache.
+
+    Prefers /proc/meminfo MemAvailable; SC_AVPHYS_PAGES is only MemFree and
+    badly underreports on a machine with a warm page cache.
+    """
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except OSError:
+        pass
+    try:
+        import psutil
+        return psutil.virtual_memory().available
+    except ImportError:
+        pass
+    return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_AVPHYS_PAGES")
+
+
 def export_flattened_tiff(pieces: list, output_path: str):
     if not pieces:
         return
@@ -115,11 +136,7 @@ def export_flattened_tiff(pieces: list, output_path: str):
     origin_x, origin_y, canvas_w, canvas_h = _union_bbox(pieces, affines)
 
     canvas_bytes = canvas_h * canvas_w * 4
-    try:
-        import psutil
-        avail = psutil.virtual_memory().available
-    except ImportError:
-        avail = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_AVPHYS_PAGES")
+    avail = _available_memory()
     if canvas_bytes > avail * 0.8:
         raise MemoryError(
             f"Flattened export canvas would be {canvas_w} x {canvas_h} "
