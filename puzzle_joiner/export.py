@@ -1,3 +1,4 @@
+import contextlib
 import math
 import os
 
@@ -103,26 +104,44 @@ def _export_affines(pieces):
     return result
 
 
-def _piece_bbox(piece, M):
+def _piece_bbox(piece, M, uncropped=False):
     """Axis-aligned bounding box (x, y, w, h) of a piece's opaque area under affine M."""
-    corners = piece.get_outline_points().reshape(-1, 1, 2)
+    corners = piece.get_outline_points(use_lasso=not uncropped).reshape(-1, 1, 2)
     transformed = cv2.transform(corners, M.astype(np.float32)).reshape(-1, 2)
     min_xy = transformed.min(axis=0)
     max_xy = transformed.max(axis=0)
     if piece.lasso_poly is not None:
-        # The lasso's antialiased edge and the bilinear warp both reach about a
-        # pixel past the polygon vertices — keep that fringe inside the canvas.
-        min_xy = min_xy - 1.0
-        max_xy = max_xy + 1.0
+        # `fillPoly` antialiases the mask about a pixel outside the polygon, and
+        # the bilinear warp spreads that another pixel in canvas space — so the
+        # opaque area reaches a little past the transformed vertices. Padding by
+        # the piece's scale plus two covers both, whichever way round they are.
+        # The rect box gets the same pad, so it stays a superset of the lasso box
+        # and the shared canvas cannot clip the fringe off either file.
+        pad = math.sqrt(abs(M[0, 0] * M[1, 1] - M[0, 1] * M[1, 0])) + 2.0
+        min_xy = min_xy - pad
+        max_xy = max_xy + pad
     return min_xy[0], min_xy[1], max_xy[0] - min_xy[0], max_xy[1] - min_xy[1]
 
 
-def _union_bbox(pieces, affines):
+def export_canvas(pieces, affines):
+    """The canvas every file of one export shares: (origin_x, origin_y, w, h).
+
+    Sized from the crop rects, not the lasso hulls. The uncropped file needs the
+    pixels outside the hulls, so sizing to the hulls would clip it; sizing both
+    to the rects instead makes every file come out the same shape, on the same
+    origin, overlapping pixel for pixel. A georeference worked out on the
+    uncropped file therefore carries over to the lassoed one unchanged — the
+    lassoed one just has transparent pixels where the uncropped one has map.
+    """
+    return _union_bbox(pieces, affines, uncropped=True)
+
+
+def _union_bbox(pieces, affines, uncropped=False):
     """Compute (origin_x, origin_y, canvas_w, canvas_h) union of all pieces."""
     min_x = min_y = float('inf')
     max_x = max_y = float('-inf')
     for piece, M in zip(pieces, affines):
-        x, y, w, h = _piece_bbox(piece, M)
+        x, y, w, h = _piece_bbox(piece, M, uncropped)
         min_x = min(min_x, x)
         min_y = min(min_y, y)
         max_x = max(max_x, x + w)
@@ -130,9 +149,9 @@ def _union_bbox(pieces, affines):
     return min_x, min_y, int(math.ceil(max_x - min_x)), int(math.ceil(max_y - min_y))
 
 
-def _canvas_bbox(piece, M, origin_x, origin_y, canvas_w, canvas_h):
+def _canvas_bbox(piece, M, origin_x, origin_y, canvas_w, canvas_h, uncropped=False):
     """Integer canvas-space bbox (x0, y0, x1, y1) of a piece, clipped to the canvas."""
-    bx_f, by_f, bw_f, bh_f = _piece_bbox(piece, M)
+    bx_f, by_f, bw_f, bh_f = _piece_bbox(piece, M, uncropped)
     x0 = max(0, int(math.floor(bx_f - origin_x)))
     y0 = max(0, int(math.floor(by_f - origin_y)))
     x1 = min(canvas_w, int(math.ceil(bx_f + bw_f - origin_x)))
@@ -206,9 +225,10 @@ def _row_tiles(row, row_x, canvas_w):
             yield cv2.cvtColor(tile, cv2.COLOR_BGRA2RGBA)
 
 
-def _flattened_tiles(pieces, affines, origin_x, origin_y, canvas_w, canvas_h):
+def _flattened_tiles(pieces, affines, origin_x, origin_y, canvas_w, canvas_h,
+                     uncropped=False):
     """Stream the composited canvas as RGBA tiles, one band of rows at a time."""
-    boxes = [_canvas_bbox(p, M, origin_x, origin_y, canvas_w, canvas_h)
+    boxes = [_canvas_bbox(p, M, origin_x, origin_y, canvas_w, canvas_h, uncropped)
              for p, M in zip(pieces, affines)]
     band_h = _band_height(canvas_w)
     for band_y in range(0, canvas_h, band_h):
@@ -256,7 +276,7 @@ def export_layered_tiff(pieces: list, output_path: str):
         return
     pieces = export_order(pieces)
     affines = _export_affines(pieces)
-    origin_x, origin_y, canvas_w, canvas_h = _union_bbox(pieces, affines)
+    origin_x, origin_y, canvas_w, canvas_h = export_canvas(pieces, affines)
     _check_memory(canvas_w, TILE)
 
     with tifffile.TiffWriter(output_path, bigtiff=True) as tiff:
@@ -307,17 +327,49 @@ def _check_memory(canvas_w: int, band_h: int):
         )
 
 
-def export_flattened_tiff(pieces: list, output_path: str):
+@contextlib.contextmanager
+def _lassos_lifted(pieces):
+    """Put every piece's unmasked alpha back for the duration of the block.
+
+    A lasso mask lives in `image`'s own alpha channel, which is what lets the
+    export warp a zero-copy view of the crop. The uncropped export wants those
+    pixels, so the mask is lifted here instead of the pixels being copied, and
+    recomputed from `_base_alpha` afterwards.
+    """
+    lifted = [p for p in pieces
+              if p.lasso_poly is not None and p._base_alpha is not None]
+    for piece in lifted:
+        piece.image[:, :, 3] = piece._base_alpha
+    try:
+        yield
+    finally:
+        for piece in lifted:
+            piece.refresh_lasso_mask()
+
+
+def export_flattened_tiff(pieces: list, output_path: str, uncropped: bool = False):
+    """Composite every piece onto one canvas and write it as a tiled BigTIFF.
+
+    With `uncropped`, a lassoed piece keeps the pixels outside its polygon: the
+    mask comes off and the piece contributes its whole crop rect. Canvas and
+    layout are the same either way (see `export_canvas`), so the two files
+    overlay exactly — one carries everything that was scanned, the other only
+    the pixels inside the lassos.
+    """
     if not pieces:
         return
     pieces = export_order(pieces)
     affines = _export_affines(pieces)
-    origin_x, origin_y, canvas_w, canvas_h = _union_bbox(pieces, affines)
+    origin_x, origin_y, canvas_w, canvas_h = export_canvas(pieces, affines)
     _check_memory(canvas_w, _band_height(canvas_w))
 
-    with tifffile.TiffWriter(output_path, bigtiff=True) as tiff:
+    with contextlib.ExitStack() as stack:
+        if uncropped:
+            stack.enter_context(_lassos_lifted(pieces))
+        tiff = stack.enter_context(tifffile.TiffWriter(output_path, bigtiff=True))
         tiff.write(
-            _flattened_tiles(pieces, affines, origin_x, origin_y, canvas_w, canvas_h),
+            _flattened_tiles(pieces, affines, origin_x, origin_y,
+                             canvas_w, canvas_h, uncropped),
             shape=(canvas_h, canvas_w, 4),
             dtype=np.uint8,
             photometric="rgb",

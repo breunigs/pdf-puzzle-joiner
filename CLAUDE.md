@@ -38,6 +38,7 @@ tests/
   test_undo.py             # undo/redo commands (transform, snap, lock)
   test_lasso.py            # lasso crop: alpha masking, polygon editor, cut-tool undo
   test_legend.py           # legends: cutting, anchor/upright math, gating, persistence
+  test_export.py           # export: rotation, band streaming, lasso + uncropped canvas
   test_boot.py             # smoke test: MainWindow constructs, legend add/undo/restore
 ```
 
@@ -74,7 +75,9 @@ Note the legend body *does* swing when it is uprighted; only the anchor is pinne
 ### `export.py`
 - **Layered TIFF**: each piece as a separate BigTIFF layer (deflate, 1024x1024 tiles).
 - **Flattened TIFF**: alpha-composite all pieces onto single canvas.
-- Canvas is sized from `get_outline_points()`, so a lasso shrinks it to the polygon hull (plus a 1 px fringe for the antialiased edge). Masked-out pixels are transparent and need no special handling.
+- **Uncropped flattened TIFF** (`export_flattened_tiff(..., uncropped=True)`): the same composite with every lasso reduced to its bounding rect, written alongside the others as `{name}_uncropped_flat.tif`. `_lassos_lifted` puts each piece's `_base_alpha` back for the duration of the write rather than copying pixels, so the warps stay zero-copy, and `refresh_lasso_mask()` rebuilds the mask afterwards.
+- **One canvas for every file.** `export_canvas` is sized from the crop rects — never from the lasso hulls, which would clip the uncropped file — so all three files come out the same size on the same origin and overlay exactly. That is the point of the uncropped file: georeference it, then swap the lassoed one in for display. Only the interpolation differs, by at most one step, because the two renders hand `warpAffine` different box offsets.
+- Per piece, `_piece_bbox` still renders only the area that can show, so a lasso keeps its warp down to the polygon hull. The hull is padded by the piece's scale plus 2 px: `fillPoly` antialiases the mask outside the polygon and the warp spreads that again, and the same pad on the rect box keeps it a superset so the shared canvas clips neither file.
 - `_compute_optimal_rotation` sees map pieces only: a legend is not part of the shape being minimised, and it does not keep the angle it is measured at. `_export_affines` then rides each legend along the global rotation as far as its anchor, re-emits it upright, and runs `separate_legends` to nudge any overlaps apart (all three in `legend.py`); everything downstream is affine-generic and needs no legend case. `export_order` puts legends last so they composite on top.
 
 ### `widgets.py`

@@ -834,17 +834,20 @@ class MainWindow(QMainWindow):
         base, ext = os.path.splitext(path)
         layered_path = f"{base}_layered{ext}"
         flat_path = f"{base}_flat{ext}"
+        uncropped_path = f"{base}_uncropped_flat{ext}"
 
         def task(progress):
             progress.emit(5, "Exporting flattened TIFF...")
             export_flattened_tiff(self.pieces, flat_path)
-            progress.emit(50, "Exporting layered TIFF...")
+            progress.emit(35, "Exporting uncropped flattened TIFF...")
+            export_flattened_tiff(self.pieces, uncropped_path, uncropped=True)
+            progress.emit(65, "Exporting layered TIFF...")
             export_layered_tiff(self.pieces, layered_path)
             progress.emit(95, "Done.")
-            return (layered_path, flat_path)
+            return (layered_path, flat_path, uncropped_path)
 
         def on_done(paths):
-            self.status_bar.showMessage(f"Exported: {paths[0]} and {paths[1]}")
+            self.status_bar.showMessage("Exported: " + ", ".join(paths))
 
         self._run_with_progress("Exporting", task, on_done=on_done)
 

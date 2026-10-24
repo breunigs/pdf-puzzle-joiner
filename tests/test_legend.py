@@ -20,7 +20,7 @@ from puzzle_joiner.legend import (
 )
 from puzzle_joiner.export import (
     _compute_optimal_rotation, _export_affines, _layer_name, _rotation_about,
-    _union_bbox, export_flattened_tiff, export_layered_tiff, export_order,
+    export_canvas, export_flattened_tiff, export_layered_tiff, export_order,
 )
 from puzzle_joiner.cache import save_layout, load_layout, load_legends
 
@@ -665,7 +665,7 @@ class TestLegendInExportedFile:
         export_flattened_tiff(pieces, str(out))
         got = tifffile.imread(str(out))
         affines = _export_affines(export_order(pieces))
-        ox, oy, w, h = _union_bbox(export_order(pieces), affines)
+        ox, oy, w, h = export_canvas(export_order(pieces), affines)
         assert got.shape[:2] == (h, w)
         # The legend's own centre must be opaque in the composite.
         M = affines[-1]

@@ -114,14 +114,18 @@ class PuzzlePiece:
             img[:, :, 3] = self._base_alpha
         return img
 
-    def get_outline_points(self) -> np.ndarray:
+    def get_outline_points(self, use_lasso: bool = True) -> np.ndarray:
         """Opaque extent in piece-local (cropped) coords, as an Nx2 float32 array.
 
         The lasso polygon when one is set, else the four crop-rect corners. Lets
         the export size its canvas to the pixels that actually show.
+
+        `use_lasso=False` always gives the crop-rect corners, which is the
+        extent the uncropped export needs — there the lasso contributes its
+        bounding box and nothing more.
         """
         w, h = self._cropped_size()
-        if self.lasso_poly is None:
+        if self.lasso_poly is None or not use_lasso:
             return np.array([[0, 0], [w, 0], [w, h], [0, h]], dtype=np.float32)
         ox, oy = self.crop_rect[:2] if self.crop_rect is not None else (0, 0)
         pts = np.array(self.lasso_poly, dtype=np.float32) - np.array([ox, oy], np.float32)
