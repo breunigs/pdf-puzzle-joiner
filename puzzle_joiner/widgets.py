@@ -14,7 +14,7 @@ from PySide6.QtWidgets import (
     QButtonGroup, QDialog, QDialogButtonBox, QLineEdit, QFormLayout,
     QMenu, QFrame, QGridLayout,
     QAbstractScrollArea, QMessageBox,
-    QSplitter, QComboBox, QTableWidget, QTableWidgetItem,
+    QSplitter, QComboBox, QTableWidget, QTableWidgetItem, QCheckBox,
     QHeaderView, QAbstractItemView,
 )
 from PySide6.QtCore import (
@@ -2692,4 +2692,88 @@ class GeorefDialog(QDialog):
 
     def _apply(self):
         self.result_gcps = list(self._gcps)
+        self.accept()
+
+
+class ExportOptionsDialog(QDialog):
+    """Pick which files an export writes.
+
+    Every entry stands alone. The georeferenced file used to be a warp of the
+    flattened one and so had to be asked for alongside it; it now composites
+    the pieces itself (`export.export_geotiff`) and shares nothing with the
+    others, so the only thing it still depends on is having control points.
+    """
+
+    _VARIANTS = (
+        ("flat", "Flattened TIFF", "{name}_flat.tif",
+         "Every piece composited onto one canvas."),
+        ("uncropped", "Uncropped flattened TIFF", "{name}_uncropped_flat.tif",
+         "The same composite with each lasso reduced to its bounding rect."),
+        ("layered", "Layered TIFF", "{name}_layered.tif",
+         "Each piece as its own layer."),
+    )
+
+    def __init__(self, can_warp: bool, selected: dict = None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Export")
+        self._can_warp = can_warp
+        selected = selected or {}
+        # The georeferenced file is the point of an export once the pages are
+        # tied to the world, so on its own it is the default. Without control
+        # points it cannot be written at all, and the flat file takes over —
+        # otherwise the dialog would open with nothing to agree to.
+        defaults = {"warp"} if can_warp else {"flat"}
+        self.result_options = None
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("Write which files?"))
+
+        self.boxes = {}
+        for key, label, suffix, hint in self._VARIANTS:
+            box = QCheckBox(f"{label}   ({suffix})")
+            box.setChecked(selected.get(key, key in defaults))
+            box.setToolTip(hint)
+            layout.addWidget(box)
+            self.boxes[key] = box
+
+        self.warp_box = QCheckBox(
+            "Georeferenced TIFF   ({name}_warped.tif, {name}_warped.qgs)")
+        self.warp_box.setToolTip(
+            "The map placed in the world, legends left upright, plus a QGIS "
+            "project pointing at it."
+            if can_warp else
+            "No control points yet — georeference a page first (Ctrl+G).")
+        self.warp_box.setEnabled(can_warp)
+        self.warp_box.setChecked(can_warp and selected.get("warp", "warp" in defaults))
+        layout.addWidget(self.warp_box)
+
+        self.note = QLabel()
+        self.note.setWordWrap(True)
+        layout.addWidget(self.note)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
+                                   | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self._apply)
+        buttons.rejected.connect(self.reject)
+        self.ok_button = buttons.button(QDialogButtonBox.StandardButton.Ok)
+        layout.addWidget(buttons)
+
+        for box in self._all_boxes():
+            box.toggled.connect(self._sync_ok)
+        if not can_warp:
+            self.note.setText("Georeference a page to enable the geo-referenced file.")
+        self._sync_ok()
+
+    def _all_boxes(self):
+        return list(self.boxes.values()) + [self.warp_box]
+
+    def _sync_ok(self):
+        """Any one file is a valid export, the georeferenced one included."""
+        self.ok_button.setEnabled(
+            any(box.isChecked() for box in self._all_boxes()))
+
+    def _apply(self):
+        self.result_options = {key: box.isChecked()
+                               for key, box in self.boxes.items()}
+        self.result_options["warp"] = self.warp_box.isChecked()
         self.accept()

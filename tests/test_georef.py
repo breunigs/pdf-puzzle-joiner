@@ -402,6 +402,81 @@ def _write_tiny_geotiff(path):
     os.remove(plain)
 
 
+class TestExportOptionsDialog(unittest.TestCase):
+    """Choosing which files an export writes."""
+
+    def setUp(self):
+        from PySide6.QtWidgets import QApplication
+        self.app = QApplication.instance() or QApplication([])
+
+    def dialog(self, can_warp=True, selected=None):
+        from puzzle_joiner.widgets import ExportOptionsDialog
+        return ExportOptionsDialog(can_warp, selected)
+
+    def test_the_georeferenced_file_is_the_only_default(self):
+        dlg = self.dialog()
+        dlg._apply()
+        self.assertEqual(dlg.result_options,
+                         {"flat": False, "uncropped": False, "layered": False,
+                          "warp": True})
+
+    def test_the_default_without_control_points_is_the_flat_file_alone(self):
+        dlg = self.dialog(can_warp=False)
+        dlg._apply()
+        self.assertEqual(dlg.result_options,
+                         {"flat": True, "uncropped": False, "layered": False,
+                          "warp": False})
+
+    def test_warp_is_unavailable_without_control_points(self):
+        dlg = self.dialog(can_warp=False)
+        self.assertFalse(dlg.warp_box.isEnabled())
+        self.assertFalse(dlg.warp_box.isChecked())
+        dlg._apply()
+        self.assertFalse(dlg.result_options["warp"])
+
+    def test_the_geo_file_does_not_depend_on_the_flat_one(self):
+        """It composites the pieces itself; it no longer warps that file."""
+        dlg = self.dialog()
+        dlg.boxes["flat"].setChecked(True)
+        dlg.boxes["flat"].setChecked(False)
+        self.assertTrue(dlg.warp_box.isEnabled())
+        self.assertTrue(dlg.warp_box.isChecked())
+        dlg._apply()
+        self.assertEqual(dlg.result_options,
+                         {"flat": False, "uncropped": False, "layered": False,
+                          "warp": True})
+
+    def test_the_geo_file_alone_is_a_valid_export(self):
+        dlg = self.dialog()
+        for box in dlg.boxes.values():
+            box.setChecked(False)
+        self.assertTrue(dlg.warp_box.isChecked())
+        self.assertTrue(dlg.ok_button.isEnabled())
+
+    def test_ok_is_refused_when_nothing_at_all_is_selected(self):
+        dlg = self.dialog()
+        for box in dlg.boxes.values():
+            box.setChecked(False)
+        dlg.warp_box.setChecked(False)
+        self.assertFalse(dlg.ok_button.isEnabled())
+        dlg.boxes["layered"].setChecked(True)
+        self.assertTrue(dlg.ok_button.isEnabled())
+
+    def test_a_previous_selection_is_offered_again(self):
+        previous = {"flat": False, "uncropped": True, "layered": False,
+                    "warp": True}
+        dlg = self.dialog(selected=previous)
+        self.assertFalse(dlg.boxes["flat"].isChecked())
+        self.assertTrue(dlg.boxes["uncropped"].isChecked())
+        # Independent of the flat file, so the remembered choice stands.
+        self.assertTrue(dlg.warp_box.isChecked())
+
+    def test_cancelling_yields_no_options(self):
+        dlg = self.dialog()
+        dlg.reject()
+        self.assertIsNone(dlg.result_options)
+
+
 class TestDialogDefaults(unittest.TestCase):
     """The split follows the page's long axis."""
 

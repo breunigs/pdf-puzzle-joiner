@@ -37,7 +37,7 @@ from .worker import Worker
 from .priority import _set_low_priority
 from .widgets import (
     PuzzleScene, PuzzleView, ThumbnailPanel,
-    PdfImportDialog, CutToolDialog, GeorefDialog,
+    PdfImportDialog, CutToolDialog, GeorefDialog, ExportOptionsDialog,
 )
 from .undo import (
     TransformCommand, SnapCommand, SnapAllCommand, DeleteCommand, LockCommand,
@@ -57,6 +57,8 @@ class MainWindow(QMainWindow):
         self._layout_dir: Optional[str] = None
         # One georeference method per document; see `cache.save_layout`.
         self._georef_method = georef.DEFAULT_METHOD
+        # Which files the last export wrote, so the next one offers the same.
+        self._export_options = None
         self._thread_pool = QThreadPool.globalInstance()
         self.undo_stack = QUndoStack(self)
         self.undo_stack.indexChanged.connect(self._auto_save_layout)
@@ -868,6 +870,16 @@ class MainWindow(QMainWindow):
     def on_export(self):
         if not self.pieces:
             return
+        gcps = canvas_gcps(self.pieces) if georef.available() else []
+        method = self._georef_method
+
+        # What to write is asked before where to put it, so backing out of the
+        # choice costs nothing and the file dialog is the last step.
+        dlg = ExportOptionsDialog(bool(gcps), self._export_options, self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        options = self._export_options = dlg.result_options
+
         src = self._input_path or self.pieces[0].source_path
         default_name = os.path.splitext(src)[0] + ".tif"
         path, _ = QFileDialog.getSaveFileName(
@@ -884,22 +896,30 @@ class MainWindow(QMainWindow):
         # Beside the raster, because the import task resolves the
         # layer source against the project's own directory.
         project_path = f"{base}_warped.qgs"
-        gcps = canvas_gcps(self.pieces) if georef.available() else []
-        method = self._georef_method
-        if gcps:
-            # QGIS has to be started from the GUI thread, and the export runs
-            # off it — so get that out of the way before it begins.
+        if options["warp"]:
+            # QGIS has to be started from the GUI thread, and the warp runs off
+            # it — so get that out of the way before the export begins.
             georef.initialize()
 
         def task(progress):
-            progress.emit(5, "Exporting flattened TIFF...")
-            export_flattened_tiff(self.pieces, flat_path)
-            progress.emit(30, "Exporting uncropped flattened TIFF...")
-            export_flattened_tiff(self.pieces, uncropped_path, uncropped=True)
-            progress.emit(50, "Exporting layered TIFF...")
-            export_layered_tiff(self.pieces, layered_path)
-            written = [layered_path, flat_path, uncropped_path]
-            if gcps:
+            written = []
+            # Each export streams a canvas-sized band at a time and sizes that
+            # band to the free memory, so they run one after another rather
+            # than at once — two in flight would each believe they had the RAM
+            # the other was using.
+            if options["flat"]:
+                progress.emit(5, "Exporting flattened TIFF...")
+                export_flattened_tiff(self.pieces, flat_path)
+                written.append(flat_path)
+            if options["uncropped"]:
+                progress.emit(30, "Exporting uncropped flattened TIFF...")
+                export_flattened_tiff(self.pieces, uncropped_path, uncropped=True)
+                written.append(uncropped_path)
+            if options["layered"]:
+                progress.emit(50, "Exporting layered TIFF...")
+                export_layered_tiff(self.pieces, layered_path)
+                written.append(layered_path)
+            if options["warp"]:
                 progress.emit(70, "Exporting georeferenced TIFF...")
                 if export_geotiff(self.pieces, warped_path, gcps, method):
                     written.append(warped_path)
