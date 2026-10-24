@@ -9,7 +9,7 @@ Python/Qt desktop app for assembling puzzle pieces from scanned PDFs or images. 
 - **OpenCV** for image processing and feature matching
 - **NumPy**, **tifffile** for array manipulation and TIFF export
 - **Poppler** (`pdfseparate`, `pdftocairo`, `pdfinfo`) and **ImageMagick** (`convert`) for PDF handling
-- **System QGIS** (Qt5/PyQt5, optional) for the OSM basemap and the GCP fitting behind the georeference dialog. Both are system packages, not wheels; see `georef.py` for how a Qt5 library runs inside this Qt6 app.
+- **System QGIS** (Qt5/PyQt5, optional) for OSM tiles and GCP fitting. The georeferenced export needs no GDAL — it writes the GeoTIFF tags itself. Both are system packages, not wheels; see `georef.py` for how a Qt5 library runs inside this Qt6 app.
 
 ## File Structure
 
@@ -93,6 +93,10 @@ What is borrowed is the tile stack (fetching, caching, zoom choice, reprojection
 - **One canvas for every file.** `export_canvas` is sized from the crop rects — never from the lasso hulls, which would clip the uncropped file — so all three files come out the same size on the same origin and overlay exactly. That is the point of the uncropped file: georeference it, then swap the lassoed one in for display. Only the interpolation differs, by at most one step, because the two renders hand `warpAffine` different box offsets.
 - `_warp_region` fills the destination a column at a time and crops the source to the window that can actually reach it. Both halves matter at this size: the whole page was otherwise handed to OpenCV for every band it touches, and OpenCV's **Lanczos path refuses a source at or past SHRT_MAX on either axis** — which one page of a 300 dpi plan reaches on its own. Linear and cubic have no such limit, so cubic is the fallback if a source slice ever exceeds it anyway.
 - Per piece, `_piece_bbox` still renders only the area that can show, so a lasso keeps its warp down to the polygon hull. The hull is padded by the piece's scale plus 2 px: `fillPoly` antialiases the mask outside the polygon and the warp spreads that again, and the same pad on the rect box keeps it a superset so the shared canvas clips neither file.
+- **Georeferenced TIFF** (`{name}_warped.tif`): offered whenever a page carries control points. `export_geotiff` folds the georeferencing into the affines the compositor already applies, so there is **no warping step and no intermediate raster** — the pixels are read once, resampled once (Lanczos), and streamed band by band like every other export. That is what lets it survive a canvas far larger than memory; a 5.8 Gpx export of a real plan takes ~130 s and 221 MB.
+- `canvas_gcps` pools every page's points in canvas coordinates, with no origin subtracted: the export derives its own origin after transforming. The coordinates are absolute, so adding or removing a legend cannot shift them.
+- `georef_transform` turns the fit into a grid whose pixel **is the fit's own scale**. At that pixel size the map's transform is a pure rotation, which is the whole trick: no rescaling of anything, and `_export_affines(pieces, global_transform=G)` then handles legends with the machinery that already existed. A legend rides the georeferencing as far as its anchor and is re-emitted upright there, so it **follows the map round without being turned with it** — see `legend.py`. `export_order` still composites legends last, so they sit on top. Verified on a plan whose pages sit at 16.6°: the legends come out axis-aligned and crisp.
+- `_geotiff_tags` writes the pixel scale, tie point and CRS straight into the TIFF. Bolting them on afterwards with `gdal_translate` would re-encode every tile to record six numbers.
 - `_compute_optimal_rotation` sees map pieces only: a legend is not part of the shape being minimised, and it does not keep the angle it is measured at. `_export_affines` then rides each legend along the global rotation as far as its anchor, re-emits it upright, and runs `separate_legends` to nudge any overlaps apart (all three in `legend.py`); everything downstream is affine-generic and needs no legend case. `export_order` puts legends last so they composite on top.
 
 ### `widgets.py`
@@ -127,8 +131,9 @@ PDF/Images → convert & clean (parallel, low-prio) → cache → PuzzlePiece li
   → Manual adjust / Snap / Cut → Export TIFF
                               ↘ Add Legend (region off any page, excluded from
                                 matching) → placed by hand → uprighted on export
-                              ↘ Georeference (per page, against OSM) → control
-                                points saved with the layout
+                              ↘ Georeference (per page, against OSM) → points
+                                pooled → fit folded into the export affines →
+                                {name}_warped.tif (+ .qgs), legends upright
 ```
 
 ## Running

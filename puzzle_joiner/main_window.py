@@ -27,7 +27,10 @@ from .cache import (
     load_georef_method,
 )
 from .matching import auto_detect_placements, snap_piece_to_neighbors
-from .export import export_layered_tiff, export_flattened_tiff
+from .export import (
+    export_layered_tiff, export_flattened_tiff, canvas_gcps, export_geotiff,
+    write_qgis_project,
+)
 from .legend import make_legend_piece, clone_legend_piece
 from . import georef
 from .worker import Worker
@@ -877,16 +880,34 @@ class MainWindow(QMainWindow):
         layered_path = f"{base}_layered{ext}"
         flat_path = f"{base}_flat{ext}"
         uncropped_path = f"{base}_uncropped_flat{ext}"
+        warped_path = f"{base}_warped{ext}"
+        # Beside the raster, because the import task resolves the
+        # layer source against the project's own directory.
+        project_path = f"{base}_warped.qgs"
+        gcps = canvas_gcps(self.pieces) if georef.available() else []
+        method = self._georef_method
+        if gcps:
+            # QGIS has to be started from the GUI thread, and the export runs
+            # off it — so get that out of the way before it begins.
+            georef.initialize()
 
         def task(progress):
             progress.emit(5, "Exporting flattened TIFF...")
             export_flattened_tiff(self.pieces, flat_path)
-            progress.emit(35, "Exporting uncropped flattened TIFF...")
+            progress.emit(30, "Exporting uncropped flattened TIFF...")
             export_flattened_tiff(self.pieces, uncropped_path, uncropped=True)
-            progress.emit(65, "Exporting layered TIFF...")
+            progress.emit(50, "Exporting layered TIFF...")
             export_layered_tiff(self.pieces, layered_path)
+            written = [layered_path, flat_path, uncropped_path]
+            if gcps:
+                progress.emit(70, "Exporting georeferenced TIFF...")
+                if export_geotiff(self.pieces, warped_path, gcps, method):
+                    written.append(warped_path)
+                    progress.emit(92, "Writing QGIS project...")
+                    if write_qgis_project(project_path, warped_path):
+                        written.append(project_path)
             progress.emit(95, "Done.")
-            return (layered_path, flat_path, uncropped_path)
+            return tuple(written)
 
         def on_done(paths):
             self.status_bar.showMessage("Exported: " + ", ".join(paths))

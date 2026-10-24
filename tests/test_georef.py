@@ -7,6 +7,7 @@ left unconditional, because that is the piece this project owns.
 """
 
 import json
+import math
 import os
 import sys
 import tempfile
@@ -18,6 +19,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from puzzle_joiner import georef
 from puzzle_joiner.cache import save_layout, load_layout, load_georef_method
+from puzzle_joiner.export import (
+    canvas_gcps, export_canvas, _export_affines, _union_bbox,
+)
 from puzzle_joiner.model import PuzzlePiece
 
 HAS_QGIS = georef.available()
@@ -30,6 +34,118 @@ def make_piece(w=200, h=100, name="page_0001.png"):
     piece.image = np.zeros((h, w, 4), dtype=np.uint8)
     piece.image[:, :, 3] = 255
     return piece
+
+
+class TestCanvasGcps(unittest.TestCase):
+    """Page control points, pooled and expressed in exported-canvas pixels."""
+
+    def test_a_point_lands_where_its_pixel_lands(self):
+        """Canvas coords are absolute: a piece sits centred on its position."""
+        piece = make_piece(200, 100)
+        piece.gcps = [(10.0, 20.0, 1000.0, 2000.0)]
+        px, py, map_x, map_y = canvas_gcps([piece])[0]
+        # The piece is centred on (x, y), so its top-left is at (-100, -50).
+        self.assertAlmostEqual(px, 10.0 - 100.0, places=3)
+        self.assertAlmostEqual(py, 20.0 - 50.0, places=3)
+        self.assertEqual((map_x, map_y), (1000.0, 2000.0))
+
+    def test_a_crop_that_keeps_content_still_keeps_the_point_still(self):
+        """The cut tool compensates position so pixels stay put; so must points.
+
+        A crop redefines the piece's local origin and its centre, which on its
+        own would drag the image across the canvas. `on_cut` cancels that, and
+        a control point has to ride along with the pixel it marks.
+        """
+        crop = (20, 10, 150, 80)
+        plain = make_piece(200, 100)
+        plain.gcps = [(60.0, 40.0, 0.0, 0.0)]
+        cropped = make_piece(200, 100)
+        cropped.gcps = [(60.0, 40.0, 0.0, 0.0)]
+        cropped.apply_crop(crop)
+        # The same compensation `MainWindow.on_cut` applies, with no rotation.
+        cropped.x += (crop[0] + crop[2] / 2.0) - 200 / 2.0
+        cropped.y += (crop[1] + crop[3] / 2.0) - 100 / 2.0
+        self.assertAlmostEqual(canvas_gcps([plain])[0][0],
+                               canvas_gcps([cropped])[0][0], places=3)
+        self.assertAlmostEqual(canvas_gcps([plain])[0][1],
+                               canvas_gcps([cropped])[0][1], places=3)
+
+    def test_moving_the_page_moves_its_points_the_same_way(self):
+        piece = make_piece()
+        piece.gcps = [(10.0, 20.0, 0.0, 0.0)]
+        before = canvas_gcps([piece])[0]
+        piece.x += 500.0
+        piece.y -= 300.0
+        after = canvas_gcps([piece])[0]
+        self.assertAlmostEqual(after[0] - before[0], 500.0, places=3)
+        self.assertAlmostEqual(after[1] - before[1], -300.0, places=3)
+
+    def test_other_pieces_do_not_move_a_point(self):
+        """Absolute coords, so nothing else on the canvas can shift them.
+
+        This is what lets a legend be added or removed without invalidating a
+        georeference, and what lets the fit be made once for the whole canvas.
+        """
+        a = make_piece(name="page_0001.png")
+        a.gcps = [(10.0, 20.0, 0.0, 0.0)]
+        lone = canvas_gcps([a])[0]
+        b = make_piece(name="page_0002.png")
+        b.x = -1000.0
+        legend = make_piece(name="page_0001.png")
+        legend.is_legend = True
+        legend.legend_instance = 1
+        legend.x = -2000.0
+        self.assertEqual(canvas_gcps([a, b, legend])[0], lone)
+
+    def test_points_are_pooled_across_pages(self):
+        a = make_piece(name="page_0001.png")
+        a.gcps = [(1.0, 2.0, 10.0, 20.0)]
+        b = make_piece(name="page_0002.png")
+        b.gcps = [(3.0, 4.0, 30.0, 40.0), (5.0, 6.0, 50.0, 60.0)]
+        self.assertEqual(len(canvas_gcps([a, b])), 3)
+
+    def test_pages_without_points_contribute_none(self):
+        a = make_piece(name="page_0001.png")
+        b = make_piece(name="page_0002.png")
+        b.gcps = [(3.0, 4.0, 30.0, 40.0)]
+        self.assertEqual(len(canvas_gcps([a, b])), 1)
+
+    def test_legends_are_skipped(self):
+        """A legend is beside the map, not on it, so it carries no geography."""
+        page = make_piece(name="page_0001.png")
+        page.gcps = [(1.0, 2.0, 10.0, 20.0)]
+        legend = make_piece(name="page_0001.png")
+        legend.is_legend = True
+        legend.legend_instance = 1
+        legend.gcps = [(9.0, 9.0, 90.0, 90.0)]
+        pooled = canvas_gcps([page, legend])
+        self.assertEqual(len(pooled), 1)
+        self.assertEqual(pooled[0][2:], (10.0, 20.0))
+
+    def test_point_outside_the_crop_is_kept(self):
+        """The dialog shows the uncropped page; such points must survive."""
+        piece = make_piece()
+        piece.apply_crop((50, 50, 100, 40))
+        piece.gcps = [(0.0, 0.0, 10.0, 20.0)]
+        pooled = canvas_gcps([piece])
+        self.assertEqual(len(pooled), 1)
+        self.assertLess(pooled[0][0], 0.0)
+
+    def test_canvas_is_sized_from_the_crop_not_the_lasso(self):
+        """Both exported files share this canvas, so one fit suits either.
+
+        The uncropped file needs the pixels outside the hull, so the canvas has
+        to be the rect-sized one — if it ever became the hull-sized one, these
+        pixel coordinates would stop meaning the same thing in the two files.
+        """
+        piece = make_piece()
+        piece.apply_crop((10, 10, 150, 70),
+                         [(20, 20), (60, 20), (60, 50), (20, 50)])
+        affines = _export_affines([piece])
+        self.assertEqual(export_canvas([piece], affines),
+                         _union_bbox([piece], affines, uncropped=True))
+        self.assertNotEqual(export_canvas([piece], affines),
+                            _union_bbox([piece], affines, uncropped=False))
 
 
 class TestPersistence(unittest.TestCase):
@@ -115,6 +231,175 @@ class TestFit(unittest.TestCase):
     def test_minimum_counts_are_reported(self):
         for method in georef.METHODS:
             self.assertGreaterEqual(georef.minimum_gcp_count(method), 2)
+
+
+@needs_qgis
+class TestGeorefTransform(unittest.TestCase):
+    """Canvas coords to north-up raster pixels, the heart of the geo export."""
+
+    def transform(self, gcps, method="Helmert"):
+        from puzzle_joiner.export import georef_transform
+        return georef_transform(gcps, method)
+
+    def test_pixel_size_is_the_fit_scale(self):
+        """Which is what leaves the map a pure rotation and legends unscaled."""
+        _, scale = self.transform(TestFit.NORTH_UP)
+        self.assertAlmostEqual(scale, 10.0, places=6)
+
+    def test_the_map_transform_is_a_rotation_not_a_scaling(self):
+        G, _ = self.transform(TestFit.NORTH_UP)
+        linear = G[:2, :2]
+        self.assertAlmostEqual(abs(np.linalg.det(linear)), 1.0, places=6)
+        # Orthonormal: columns of unit length and at right angles.
+        self.assertAlmostEqual(float(linear[:, 0] @ linear[:, 1]), 0.0, places=6)
+        self.assertAlmostEqual(float(np.linalg.norm(linear[:, 0])), 1.0, places=6)
+
+    def test_a_north_up_fit_leaves_the_canvas_unrotated(self):
+        G, _ = self.transform(TestFit.NORTH_UP)
+        np.testing.assert_allclose(G[:2, :2], np.eye(2), atol=1e-6)
+
+    def grid_to_world(self, G, scale, canvas_x, canvas_y):
+        """Undo the grid, the way `_geotiff_tags` records it."""
+        grid = G @ np.array([canvas_x, canvas_y, 1.0])
+        return grid[0] * scale, -grid[1] * scale
+
+    def test_the_grid_round_trips_back_to_the_map_coordinates(self):
+        """The one assertion that pins every sign in the chain at once.
+
+        A control point pushed through the grid and read back with the pixel
+        size must land on the map coordinate it was given. Rotated fits are
+        included because that is where a flipped sign hides — a reflection
+        survives the north-up case untouched.
+        """
+        for name, gcps in (("north up", TestFit.NORTH_UP),
+                           ("rotated", self.ROTATED),
+                           ("rotated the other way", self.ROTATED_BACK)):
+            with self.subTest(fit=name):
+                G, scale = self.transform(gcps)
+                for canvas_x, canvas_y, map_x, map_y in gcps:
+                    got = self.grid_to_world(G, scale, canvas_x, canvas_y)
+                    self.assertAlmostEqual(got[0], map_x, places=3)
+                    self.assertAlmostEqual(got[1], map_y, places=3)
+
+    @staticmethod
+    def _rotated(degrees):
+        """Canvas points and the map coords of a page turned by `degrees`.
+
+        Canvas rows run down and northings run up, so the northing is negated
+        — the same flip `georef.fit` takes out before fitting.
+        """
+        rad = math.radians(degrees)
+        cos_a, sin_a = math.cos(rad), math.sin(rad)
+        out = []
+        for canvas_x, canvas_y in [(0.0, 0.0), (100.0, 0.0), (0.0, 100.0)]:
+            out.append((canvas_x, canvas_y,
+                        cos_a * canvas_x - sin_a * canvas_y,
+                        -(sin_a * canvas_x + cos_a * canvas_y)))
+        return out
+
+    ROTATED = _rotated(30.0)
+    ROTATED_BACK = _rotated(-55.0)
+
+    def test_a_rotated_fit_keeps_its_scale(self):
+        for gcps in (self.ROTATED, self.ROTATED_BACK):
+            _, scale = self.transform(gcps)
+            self.assertAlmostEqual(scale, 1.0, places=6)
+
+    def test_a_rotated_fit_stays_a_rotation(self):
+        """No reflection: a mirrored map would be worse than a crooked one."""
+        for gcps in (self.ROTATED, self.ROTATED_BACK):
+            G, _ = self.transform(gcps)
+            self.assertAlmostEqual(float(np.linalg.det(G[:2, :2])), 1.0, places=6)
+
+    def test_no_fit_yields_no_transform(self):
+        self.assertIsNone(self.transform([]))
+
+    def test_geotiff_tags_describe_a_north_up_grid(self):
+        from puzzle_joiner.export import _geotiff_tags
+        tags = {code: value for code, _dtype, _count, value, _w
+                in _geotiff_tags(2.5, -100.0, -40.0)}
+        self.assertEqual(tags[33550][:2], (2.5, 2.5))
+        # Tie point: raster (0,0) is the canvas origin, converted to metres and
+        # with the northing flipped back the right way up.
+        self.assertEqual(tags[33922][3:5], (-250.0, 100.0))
+        self.assertIn(3857, tags[34735])
+
+
+@needs_qgis
+class TestQgisProject(unittest.TestCase):
+    """The project file veloroute's `mix velo.map.image.from_qgis` consumes."""
+
+    @classmethod
+    def setUpClass(cls):
+        from PySide6.QtWidgets import QApplication
+        QApplication.instance() or QApplication([])
+        georef.initialize()
+        from puzzle_joiner.export import write_qgis_project
+        cls.dir = tempfile.mkdtemp()
+        cls.tif = os.path.join(cls.dir, "demo_warped.tif")
+        _write_tiny_geotiff(cls.tif)
+        cls.qgs = os.path.join(cls.dir, "demo_warped.qgs")
+        cls.written = write_qgis_project(cls.qgs, cls.tif)
+
+    def find_tifs(self):
+        """Mirror of the Mix task's `find_tifs`, step for step.
+
+        The real task could not be executed here — veloroute's compiled deps
+        are built against a different OTP than the Elixir on this machine — so
+        the pipeline is reproduced instead: checked layer-tree-layers, sources
+        ending in .tif, resolved against the project's own directory.
+        """
+        import xml.etree.ElementTree as ET
+
+        root = ET.parse(self.qgs).getroot()
+        self.assertEqual(root.tag, "qgis")
+        sources = [node.get("source")
+                   for node in root.iter("layer-tree-layer")
+                   if node.get("checked") == "Qt::Checked"]
+        tifs = [s for s in sources if s.lower().endswith(".tif")]
+        return [os.path.normpath(os.path.join(os.path.dirname(self.qgs), t))
+                for t in tifs]
+
+    def test_the_project_is_written(self):
+        self.assertTrue(self.written)
+        self.assertTrue(os.path.exists(self.qgs))
+
+    def test_it_yields_exactly_the_warped_raster(self):
+        self.assertEqual(self.find_tifs(), [self.tif])
+
+    def test_the_raster_source_is_relative_to_the_project(self):
+        """The task resolves against the project dir, so the pair can move."""
+        import xml.etree.ElementTree as ET
+
+        root = ET.parse(self.qgs).getroot()
+        sources = [n.get("source") for n in root.iter("layer-tree-layer")]
+        tif = next(s for s in sources if s.lower().endswith(".tif"))
+        self.assertFalse(os.path.isabs(tif))
+
+    def test_the_basemap_is_not_mistaken_for_a_layer_to_import(self):
+        import xml.etree.ElementTree as ET
+
+        root = ET.parse(self.qgs).getroot()
+        names = {n.get("name") for n in root.iter("layer-tree-layer")}
+        self.assertIn("osm", names)
+        self.assertEqual(len(self.find_tifs()), 1)
+
+    def test_a_missing_raster_writes_no_project(self):
+        from puzzle_joiner.export import write_qgis_project
+        out = os.path.join(self.dir, "nope.qgs")
+        self.assertFalse(write_qgis_project(out, os.path.join(self.dir, "nope.tif")))
+
+
+def _write_tiny_geotiff(path):
+    """A 4x4 north-up GeoTIFF, enough for GDAL to call the layer valid."""
+    import subprocess
+    import tifffile
+
+    plain = path + ".plain.tif"
+    tifffile.imwrite(plain, np.zeros((4, 4, 4), np.uint8), photometric="rgb")
+    subprocess.run(["gdal_translate", "-q", "-a_srs", georef.MAP_CRS,
+                    "-a_ullr", "0", "100", "100", "0", plain, path], check=True)
+    os.remove(plain)
 
 
 class TestDialogDefaults(unittest.TestCase):

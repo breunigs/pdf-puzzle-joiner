@@ -111,15 +111,28 @@ def initialize():
     _app.initQgis()
 
 
+def _make_osm_layer():
+    core, _ = _qgis()
+    url = OSM_URL.replace("{", "%7B").replace("}", "%7D")
+    return core.QgsRasterLayer(f"type=xyz&url={url}&zmax=19&zmin=0", "osm", "wms")
+
+
 def _osm_layer():
     """The OSM tile layer, built once and shared by every render."""
     global _layer
     if _layer is None:
-        core, _ = _qgis()
-        url = OSM_URL.replace("{", "%7B").replace("}", "%7D")
-        _layer = core.QgsRasterLayer(
-            f"type=xyz&url={url}&zmax=19&zmin=0", "osm", "wms")
+        _layer = _make_osm_layer()
     return _layer
+
+
+def osm_layer_for_project():
+    """A fresh OSM layer to hand to a QGIS project.
+
+    Deliberately not the shared one: a project takes ownership of the layers
+    added to it and deletes them with itself, which would leave the renderer
+    holding a dangling layer.
+    """
+    return _make_osm_layer()
 
 
 def render_osm(extent, width: int, height: int) -> np.ndarray:

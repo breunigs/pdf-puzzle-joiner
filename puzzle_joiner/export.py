@@ -6,6 +6,7 @@ import cv2
 import numpy as np
 import tifffile
 
+from . import georef
 from .model import PuzzlePiece
 from .legend import anchor_local, map_hull, separate_legends, upright_affine
 
@@ -70,7 +71,7 @@ def _rotation_about(angle, cx, cy):
     ], dtype=np.float64)
 
 
-def _export_affines(pieces):
+def _export_affines(pieces, global_transform=None):
     """Piece affine matrices as the export lays them out.
 
     The map is rotated to the angle that minimises the canvas. Legends ride along
@@ -81,13 +82,20 @@ def _export_affines(pieces):
 
     Squaring a legend up changes its footprint, so a last pass nudges legends off
     the map and off each other; see `separate_legends`.
+
+    `global_transform` replaces that angle search with a transform of the
+    caller's choosing — the georeferenced export, where the orientation is
+    dictated by the geography and not by the smallest canvas. Everything about
+    legends then applies unchanged, which is the point: a legend rides the
+    georeferencing as far as its anchor and is re-emitted upright there, so it
+    follows the map round without being turned with it.
     """
     base = [p.get_affine_matrix() for p in pieces]
     map_pieces = [p for p in pieces if not p.is_legend]
     legends = [p for p in pieces if p.is_legend]
 
-    R3 = None
-    if len(map_pieces) >= 2:
+    R3 = global_transform
+    if R3 is None and len(map_pieces) >= 2:
         angle, cx, cy = _compute_optimal_rotation(map_pieces)
         if abs(angle) >= 0.1:
             R3 = _rotation_about(angle, cx, cy)
@@ -400,6 +408,174 @@ def _lassos_lifted(pieces):
     finally:
         for piece in lifted:
             piece.refresh_lasso_mask()
+
+
+def canvas_gcps(pieces: list) -> list:
+    """Every page's control points in canvas coordinates, pooled.
+
+    Returns [(canvas_x, canvas_y, map_x, map_y), ...] across all pages, because
+    one georeference covers the whole assembled map however many pages were
+    marked up. The coordinates are the canvas space `_export_affines` works in,
+    with no origin subtracted — the georeferenced export derives its own origin
+    after transforming, so subtracting one here would only have to be undone.
+
+    A point may land outside a piece's crop: the dialog shows the uncropped
+    page, so a feature the crop later throws away can still be marked. Those
+    are kept — they constrain the fit perfectly well, and dropping them would
+    quietly weaken a fit the user believed they had made.
+    """
+    pieces = export_order(pieces)
+    affines = _export_affines(pieces)
+    out = []
+    for piece, M in zip(pieces, affines):
+        if piece.is_legend or not piece.gcps:
+            continue
+        ox, oy = piece.crop_rect[:2] if piece.crop_rect is not None else (0, 0)
+        local = np.array([[g[0] - ox, g[1] - oy] for g in piece.gcps],
+                         dtype=np.float32).reshape(-1, 1, 2)
+        world = cv2.transform(local, M.astype(np.float32)).reshape(-1, 2)
+        for (wx, wy), gcp in zip(world, piece.gcps):
+            out.append((float(wx), float(wy), float(gcp[2]), float(gcp[3])))
+    return out
+
+
+def _fit_matrix(gcps, method):
+    """The fit as a 2x3 affine from canvas coords to map units, or None.
+
+    QGIS hands back a callable, but the export needs the matrix. Both offered
+    methods are linear, so evaluating three points recovers it exactly.
+    """
+    mapped = georef.transform_points(gcps, method, [(0, 0), (1, 0), (0, 1)])
+    if mapped is None:
+        return None
+    (x0, y0), (x1, y1), (x2, y2) = mapped
+    return np.array([[x1 - x0, x2 - x0, x0],
+                     [y1 - y0, y2 - y0, y0]], dtype=np.float64)
+
+
+def georef_transform(gcps, method=georef.DEFAULT_METHOD):
+    """Canvas coords to north-up raster pixels, as (3x3 matrix, metres/pixel).
+
+    None when the points cannot be fitted.
+
+    The raster's pixel is deliberately the fit's own scale, which is what keeps
+    this cheap and keeps legends legible. At that pixel size the transform the
+    map takes on is a pure rotation: no resampling beyond the one every export
+    already does, and a legend re-emitted upright about its anchor keeps the
+    size the user gave it rather than being rescaled to suit the geography.
+
+    Map northings climb while raster rows descend, so the y axis is negated
+    here. The fit already carries one such flip (see `georef.fit`); the two
+    cancel, which is why the result is a rotation and not a reflection.
+    """
+    F = _fit_matrix(gcps, method)
+    if F is None:
+        return None
+    scale = math.sqrt(abs(F[0, 0] * F[1, 1] - F[0, 1] * F[1, 0]))
+    if scale <= 0:
+        return None
+    to_pixels = np.array([[1.0 / scale, 0.0, 0.0],
+                          [0.0, -1.0 / scale, 0.0],
+                          [0.0, 0.0, 1.0]], dtype=np.float64)
+    G = to_pixels @ np.vstack([F, [0.0, 0.0, 1.0]])
+    return G, scale
+
+
+def _geotiff_tags(scale: float, origin_x: float, origin_y: float):
+    """GeoTIFF tags for a north-up raster: pixel size, tie point, CRS.
+
+    Written straight into the TIFF rather than bolted on afterwards with
+    `gdal_translate`, which would re-encode every tile to record six numbers.
+    The grid is axis-aligned by construction, so a pixel scale and one tie
+    point say everything; `origin_*` is the raster's top-left in raster-pixel
+    units, converted back to map units here.
+    """
+    code = int(georef.MAP_CRS.split(":")[1])
+    geo_keys = [
+        1, 1, 0, 3,            # directory version, key revision, minor, count
+        1024, 0, 1, 1,         # GTModelTypeGeoKey = projected
+        1025, 0, 1, 1,         # GTRasterTypeGeoKey = pixel is area
+        3072, 0, 1, code,      # ProjectedCSTypeGeoKey
+    ]
+    return [
+        (33550, tifffile.DATATYPE.DOUBLE, 3, (scale, scale, 0.0), True),
+        (33922, tifffile.DATATYPE.DOUBLE, 6,
+         (0.0, 0.0, 0.0, origin_x * scale, -origin_y * scale, 0.0), True),
+        (34735, tifffile.DATATYPE.SHORT, len(geo_keys), tuple(geo_keys), True),
+    ]
+
+
+def export_geotiff(pieces: list, output_path: str, gcps: list,
+                   method: str = georef.DEFAULT_METHOD) -> bool:
+    """Composite the pieces straight into a georeferenced TIFF. False if unfitted.
+
+    There is no separate warping step and no intermediate raster. The
+    georeferencing is folded into the affines the compositor already applies,
+    so the pixels are read once and resampled once, and the result streams out
+    band by band like every other export — which is what makes it survive a
+    canvas far larger than memory.
+
+    This is also what keeps legends legible. They are not warped: each rides
+    the georeferencing as far as its anchor and is re-emitted upright there
+    (`_export_affines`), so it follows the map round to its new orientation
+    while staying square to the page and at its own scale. `export_order`
+    composites them last, so they sit on top of the map as before.
+    """
+    if not pieces or not gcps:
+        return False
+    transform = georef_transform(gcps, method)
+    if transform is None:
+        return False
+    G, scale = transform
+
+    pieces = export_order(pieces)
+    affines = _export_affines(pieces, global_transform=G)
+    origin_x, origin_y, canvas_w, canvas_h = export_canvas(pieces, affines)
+    _check_memory(canvas_w, _band_height(canvas_w))
+
+    with tifffile.TiffWriter(output_path, bigtiff=True) as tiff:
+        tiff.write(
+            _flattened_tiles(pieces, affines, origin_x, origin_y,
+                             canvas_w, canvas_h,
+                             interpolation=cv2.INTER_LANCZOS4),
+            shape=(canvas_h, canvas_w, 4),
+            dtype=np.uint8,
+            photometric="rgb",
+            tile=(TILE, TILE),
+            compression="deflate",
+            maxworkers=_ENCODE_WORKERS,
+            extratags=_geotiff_tags(scale, origin_x, origin_y),
+        )
+    return True
+
+
+def write_qgis_project(project_path: str, raster_path: str) -> bool:
+    """Write a QGIS project listing `raster_path`, over an OSM basemap.
+
+    Written by QGIS itself rather than assembled as XML here, so it is a real
+    project a person can open, not just something a parser will tolerate.
+
+    It exists for veloroute's `mix velo.map.image.from_qgis`, which takes a
+    project rather than a raster: it reads every `layer-tree-layer` that is
+    checked, keeps the sources ending in `.tif`, and resolves them against the
+    project's own directory. Hence relative path storage, and hence writing the
+    project beside the raster. The basemap is a tile layer, so that filter
+    drops it and only the warped raster is handed on.
+    """
+    core, _ = georef._qgis()
+    project = core.QgsProject()
+    # Relative, so moving the pair of files together keeps the project working.
+    project.setFilePathStorage(core.Qgis.FilePathType.Relative)
+    project.setCrs(core.QgsCoordinateReferenceSystem(georef.MAP_CRS))
+
+    basemap = georef.osm_layer_for_project()
+    raster = core.QgsRasterLayer(
+        raster_path, os.path.splitext(os.path.basename(raster_path))[0], "gdal")
+    if not raster.isValid():
+        return False
+    # Basemap first so it lands underneath; the map is what sits on top.
+    project.addMapLayers([layer for layer in (basemap, raster) if layer.isValid()])
+    return project.write(project_path)
 
 
 def export_flattened_tiff(pieces: list, output_path: str, uncropped: bool = False):
