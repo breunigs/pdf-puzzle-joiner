@@ -135,23 +135,34 @@ def _alpha_composite(dst, src):
         ).astype(np.uint8)
 
 
-def _band_tiles(band, band_x, canvas_w):
-    """Yield one tile row as RGBA; band covers canvas columns [band_x, band_x + width).
+def _band_tiles(band, band_x, canvas_w, band_h):
+    """Yield a band's tiles as RGBA, row-major; `None` means the band is empty.
+
+    A band spans a whole number of tile rows, so it is sliced back into TILE-high
+    rows here — the writer consumes exactly one tile per yield.
+    """
+    for y in range(0, band_h, TILE):
+        yield from _row_tiles(None if band is None else band[y:y + TILE],
+                              band_x, canvas_w)
+
+
+def _row_tiles(row, row_x, canvas_w):
+    """Yield one tile row as RGBA; row covers canvas columns [row_x, row_x + width).
 
     Converting at tile granularity keeps the colour swap off the band-sized buffer.
-    Tile positions the band does not reach are emitted as fully transparent tiles.
+    Tile positions the row does not reach are emitted as fully transparent tiles.
     """
-    band_to = band_x + band.shape[1] if band is not None else 0
+    row_to = row_x + row.shape[1] if row is not None else 0
     for x in range(0, canvas_w, TILE):
-        if band is None or x >= band_to or x + TILE <= band_x:
+        if row is None or x >= row_to or x + TILE <= row_x:
             yield np.zeros((TILE, TILE, 4), dtype=np.uint8)
-        elif x >= band_x and x + TILE <= band_to:
-            yield cv2.cvtColor(band[:, x - band_x:x - band_x + TILE], cv2.COLOR_BGRA2RGBA)
+        elif x >= row_x and x + TILE <= row_to:
+            yield cv2.cvtColor(row[:, x - row_x:x - row_x + TILE], cv2.COLOR_BGRA2RGBA)
         else:
-            # Tile straddles the edge of the band — pad the uncovered columns.
-            tile = np.zeros((band.shape[0], TILE, 4), dtype=np.uint8)
-            lo, hi = max(x, band_x), min(x + TILE, band_to)
-            tile[:, lo - x:hi - x] = band[:, lo - band_x:hi - band_x]
+            # Tile straddles the edge of the row — pad the uncovered columns.
+            tile = np.zeros((row.shape[0], TILE, 4), dtype=np.uint8)
+            lo, hi = max(x, row_x), min(x + TILE, row_to)
+            tile[:, lo - x:hi - x] = row[:, lo - row_x:hi - row_x]
             yield cv2.cvtColor(tile, cv2.COLOR_BGRA2RGBA)
 
 
@@ -166,7 +177,7 @@ def _flattened_tiles(pieces, affines, origin_x, origin_y, canvas_w, canvas_h):
         rows = [(p, M, b) for p, M, b in zip(pieces, affines, boxes)
                 if b[0] < b[2] and max(b[1], band_y) < min(b[3], band_y + bh)]
         if not rows:
-            yield from _band_tiles(None, 0, canvas_w)
+            yield from _band_tiles(None, 0, canvas_w, bh)
             continue
         band_x = min(b[0] for _, _, b in rows)
         band_w = max(b[2] for _, _, b in rows) - band_x
@@ -179,7 +190,7 @@ def _flattened_tiles(pieces, affines, origin_x, origin_y, canvas_w, canvas_h):
             _alpha_composite(
                 band[ry0 - band_y:ry1 - band_y, x0 - band_x:x1 - band_x], warped)
             del warped
-        yield from _band_tiles(band, band_x, canvas_w)
+        yield from _band_tiles(band, band_x, canvas_w, bh)
         del band
 
 
@@ -191,12 +202,12 @@ def _layer_tiles(piece, M, origin_x, origin_y, canvas_w, canvas_h):
         ry0 = max(y0, band_y)
         ry1 = min(y1, band_y + bh)
         if ry1 <= ry0 or x1 <= x0:
-            yield from _band_tiles(None, 0, canvas_w)
+            yield from _band_tiles(None, 0, canvas_w, bh)
             continue
         band = np.zeros((bh, x1 - x0, 4), dtype=np.uint8)
         band[ry0 - band_y:ry1 - band_y] = _warp_region(
             piece, M, origin_x, origin_y, x0, ry0, x1 - x0, ry1 - ry0)
-        yield from _band_tiles(band, x0, canvas_w)
+        yield from _band_tiles(band, x0, canvas_w, bh)
         del band
 
 

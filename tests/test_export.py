@@ -161,12 +161,27 @@ class TestStreamedOutput:
         p2.crop_rect = (40, 30, 500, 400)
         return [p1, p2]
 
-    @pytest.fixture(autouse=True)
-    def small_bands(self, monkeypatch):
-        """Force many tiles, several bands, and several composite chunks per band."""
+    @pytest.fixture(autouse=True, params=[32 * 1024, 2 * 1024 * 1024],
+                    ids=["one-tile-row-band", "multi-tile-row-band"])
+    def small_bands(self, request, monkeypatch):
+        """Force many tiles, several bands, and several composite chunks per band.
+
+        Parametrised over two band budgets: the smaller one makes a band exactly
+        one tile row tall, the larger several. Both must still hand the writer
+        one tile per yield.
+        """
         monkeypatch.setattr(exp, "TILE", 64)
-        monkeypatch.setattr(exp, "_BAND_BYTES", 32 * 1024)
+        monkeypatch.setattr(exp, "_BAND_BYTES", request.param)
         monkeypatch.setattr(exp, "_CHUNK_BYTES", 8 * 1024)
+
+    def test_band_taller_than_a_tile_is_split_into_tile_rows(self):
+        """A band spans whole tile rows; the writer still wants one tile per yield."""
+        band = np.zeros((exp.TILE * 3, 150, 4), dtype=np.uint8)
+        canvas_w = 300
+        tiles = list(exp._band_tiles(band, 0, canvas_w, band.shape[0]))
+        assert len(tiles) == 3 * math.ceil(canvas_w / exp.TILE)
+        assert all(t.shape == (exp.TILE, exp.TILE, 4) for t in tiles)
+        assert len(list(exp._band_tiles(None, 0, canvas_w, exp.TILE * 3))) == len(tiles)
 
     def test_flattened_matches_reference(self, tmp_path):
         pieces = self._pieces()
