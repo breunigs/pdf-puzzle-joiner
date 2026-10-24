@@ -1,5 +1,6 @@
 import os
 import shutil
+import threading
 
 
 def _build_low_prio_prefix():
@@ -25,12 +26,24 @@ def _set_low_priority():
 
 
 def _for_all_threads(fn):
-    """Call fn(tid) for every thread in the current process."""
+    """Call fn(tid) for every thread in the current process bar the main one.
+
+    The main thread draws the UI, and what `_set_process_low_priority` does to
+    it cannot be undone: both raising a nice value back and leaving SCHED_IDLE
+    need CAP_SYS_NICE, so `_restore_process_priority` fails silently and the
+    window stays idle-scheduled for the rest of the session. One background
+    task was enough to make the whole app sluggish, and the georeference
+    dialog starts one on every pan of the map. Background work is what should
+    yield; the window the user is still clicking in is not.
+    """
+    main_tid = threading.main_thread().native_id
     task_dir = "/proc/self/task"
     if os.path.isdir(task_dir):
         for tid_str in os.listdir(task_dir):
             try:
-                fn(int(tid_str))
+                tid = int(tid_str)
+                if tid != main_tid:
+                    fn(tid)
             except (OSError, AttributeError, ValueError):
                 pass
 
