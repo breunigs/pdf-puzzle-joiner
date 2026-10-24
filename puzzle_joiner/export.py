@@ -13,9 +13,10 @@ TILE = 1024
 _BAND_BYTES = 512 << 20
 # Byte budget for the float32 temporaries of a single composite step.
 _CHUNK_BYTES = 64 << 20
-# Threads tifffile may use to deflate tiles. Half the cores leaves room for the
-# band rendering (OpenCV runs its own pool) and keeps the machine usable.
-_ENCODE_WORKERS = max(1, (os.cpu_count() or 2) // 2)
+# Threads tifffile may use to deflate tiles. Three quarters of the cores leaves
+# room for the band rendering (OpenCV runs its own pool) and keeps the machine
+# usable.
+_ENCODE_WORKERS = max(1, (os.cpu_count() or 2) * 3 // 4)
 
 
 def _layer_name(piece: PuzzlePiece) -> str:
