@@ -1,5 +1,6 @@
+PY := 3.14
 DEPS := PySide6 opencv-python numpy tifffile imagecodecs
-UV_RUN := uv run $(foreach d,$(DEPS),--with $(d)) --with pytest
+UV_RUN := uv run --python $(PY) $(foreach d,$(DEPS),--with $(d)) --with pytest
 
 .PHONY: check syntax lint test boot all
 
@@ -10,7 +11,7 @@ check: syntax lint test boot
 syntax:
 	@echo "=== Syntax check ==="
 	@for f in puzzle_joiner/*.py tests/*.py; do \
-		python -c "import ast; ast.parse(open('$$f').read())" || exit 1; \
+		uv run --python $(PY) --no-project python -c "import ast; ast.parse(open('$$f').read())" || exit 1; \
 	done
 	@echo "OK"
 

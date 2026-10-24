@@ -4,7 +4,7 @@ Python/Qt desktop app for assembling puzzle pieces from scanned PDFs or images. 
 
 ## Tech Stack
 
-- **Python 3.11+**, packaged with `uv` (inline script dependencies in `puzzle-joiner`)
+- **Python 3.14+**, packaged with `uv` (inline script dependencies in `puzzle-joiner`)
 - **PySide6** (Qt6) for UI
 - **OpenCV** for image processing and feature matching
 - **NumPy**, **tifffile** for array manipulation and TIFF export
@@ -94,6 +94,8 @@ Toolbar workflow: Open PDF/Images → Auto-Detect → Snap → Cut → Add Legen
 
 ### `priority.py`
 Builds `LOW_PRIO` prefix (`chrt --idle 0 nice -n19 ionice --class idle`) for subprocesses. `_set_low_priority()` for ProcessPoolExecutor worker initializer.
+
+**Pool workers start cold.** Python 3.14 defaults to the `forkserver` start method on Linux, so a pool worker is a fresh interpreter rather than a copy of the parent: it re-imports the module and inherits no runtime state. Both pool entry points (`_load_cached_page`, `_convert_and_process_page`) and the initializer must therefore stay module-level and picklable, and must take everything they need through their args tuple — a module global set after import, or a closure, will not reach them. `LOW_PRIO` is safe because it is computed at import time, so the worker rebuilds it. This also means the pool no longer forks a live Qt process, which `fork` did.
 
 ## Key Data Flow
 
