@@ -120,7 +120,11 @@ def _export_affines(pieces, global_transform=None):
 def _piece_bbox(piece, M, uncropped=False):
     """Axis-aligned bounding box (x, y, w, h) of a piece's opaque area under affine M."""
     corners = piece.get_outline_points(use_lasso=not uncropped).reshape(-1, 1, 2)
-    transformed = cv2.transform(corners, M.astype(np.float32)).reshape(-1, 2)
+    # float64: the georeferenced export's affines translate by absolute web
+    # mercator metres over the pixel size, where float32 steps in units of
+    # whole pixels. Rounding the box there loses a strip off the edge of every
+    # piece, because `_canvas_bbox` floors and ceils whatever it is given.
+    transformed = cv2.transform(corners.astype(np.float64), M).reshape(-1, 2)
     min_xy = transformed.min(axis=0)
     max_xy = transformed.max(axis=0)
     if piece.lasso_poly is not None:
@@ -415,25 +419,35 @@ def canvas_gcps(pieces: list) -> list:
 
     Returns [(canvas_x, canvas_y, map_x, map_y), ...] across all pages, because
     one georeference covers the whole assembled map however many pages were
-    marked up. The coordinates are the canvas space `_export_affines` works in,
-    with no origin subtracted — the georeferenced export derives its own origin
-    after transforming, so subtracting one here would only have to be undone.
+    marked up. No origin is subtracted — the georeferenced export derives its
+    own origin after transforming, so subtracting one here would only have to
+    be undone.
+
+    The space is each piece's own `get_affine_matrix()`: the scene the user
+    arranged, and nothing else. Deliberately **not** `_export_affines`, which
+    first rotates the whole assembly to whatever angle minimises the canvas.
+    That angle depends on every other piece, so points taken through it would
+    shift whenever an unrelated page moved, and — worse — the georeferenced
+    export passes its own transform in place of that rotation, so a fit made
+    in the rotated space was being applied to the unrotated one. On a real
+    five-page plan sitting at 16.6 degrees that put the output up to 578 m out.
+    Canvas minimising is a packing trick for the other exports; geography must
+    not be measured through it.
 
     A point may land outside a piece's crop: the dialog shows the uncropped
     page, so a feature the crop later throws away can still be marked. Those
     are kept — they constrain the fit perfectly well, and dropping them would
     quietly weaken a fit the user believed they had made.
     """
-    pieces = export_order(pieces)
-    affines = _export_affines(pieces)
     out = []
-    for piece, M in zip(pieces, affines):
+    for piece in pieces:
         if piece.is_legend or not piece.gcps:
             continue
+        M = piece.get_affine_matrix()
         ox, oy = piece.crop_rect[:2] if piece.crop_rect is not None else (0, 0)
         local = np.array([[g[0] - ox, g[1] - oy] for g in piece.gcps],
-                         dtype=np.float32).reshape(-1, 1, 2)
-        world = cv2.transform(local, M.astype(np.float32)).reshape(-1, 2)
+                         dtype=np.float64).reshape(-1, 1, 2)
+        world = cv2.transform(local, M).reshape(-1, 2)
         for (wx, wy), gcp in zip(world, piece.gcps):
             out.append((float(wx), float(wy), float(gcp[2]), float(gcp[3])))
     return out

@@ -326,6 +326,86 @@ class TestGeorefTransform(unittest.TestCase):
 
 
 @needs_qgis
+class TestGeoreferencedPlacement(unittest.TestCase):
+    """The fit and the export must measure the canvas in the same space.
+
+    Points are taken in one space and the pieces are placed in another; if the
+    two disagree the output is silently misplaced, which no amount of checking
+    the fit's own residuals reveals. Two pages at an angle is the case that
+    matters: a single page never triggers the canvas-minimising rotation, so a
+    one-page test passes either way.
+    """
+
+    ANGLE = 16.6
+    SCALE = 0.25           # map units per canvas pixel
+    ORIGIN = (1122000.0, 7089000.0)
+
+    def truth(self, canvas_x, canvas_y):
+        """An exact similarity from canvas to map, rows down and northings up."""
+        rad = math.radians(self.ANGLE)
+        cos_a, sin_a = math.cos(rad), math.sin(rad)
+        return (self.ORIGIN[0] + self.SCALE * (cos_a * canvas_x + sin_a * canvas_y),
+                self.ORIGIN[1] - self.SCALE * (-sin_a * canvas_x + cos_a * canvas_y))
+
+    def assembly(self, with_legend=False):
+        """Two pages sitting at an angle, each with points from `truth`."""
+        import cv2
+        pieces = []
+        for index, (x, y) in enumerate(((0.0, 0.0), (900.0, 120.0))):
+            piece = make_piece(400, 300, name=f"page_{index:04d}.png")
+            piece.x, piece.y, piece.rotation_deg = x, y, self.ANGLE
+            M = piece.get_affine_matrix()
+            for img_x, img_y in ((20.0, 30.0), (360.0, 40.0), (50.0, 260.0)):
+                canvas = cv2.transform(
+                    np.array([[[img_x, img_y]]], np.float64), M).reshape(2)
+                piece.gcps.append((img_x, img_y) + self.truth(*canvas))
+            pieces.append(piece)
+        if with_legend:
+            legend = make_piece(120, 90, name="page_0000.png")
+            legend.is_legend = True
+            legend.legend_instance = 1
+            legend.x, legend.y, legend.rotation_deg = -600.0, -400.0, self.ANGLE
+            pieces.append(legend)
+        return pieces
+
+    def worst_error(self, pieces):
+        """Largest distance between a point's map coord and where it lands."""
+        import cv2
+        from puzzle_joiner.export import georef_transform, export_order
+        gcps = canvas_gcps(pieces)
+        G, scale = georef_transform(gcps, "Helmert")
+        ordered = export_order(pieces)
+        affines = _export_affines(ordered, global_transform=G)
+        worst = 0.0
+        for piece, M in zip(ordered, affines):
+            if piece.is_legend:
+                continue
+            ox, oy = (piece.crop_rect[:2] if piece.crop_rect is not None
+                      else (0, 0))
+            for img_x, img_y, map_x, map_y in piece.gcps:
+                grid = cv2.transform(
+                    np.array([[[img_x - ox, img_y - oy]]], np.float64), M).reshape(2)
+                got = (grid[0] * scale, -grid[1] * scale)
+                worst = max(worst, math.hypot(got[0] - map_x, got[1] - map_y))
+        return worst
+
+    def test_points_land_on_their_own_map_coordinates(self):
+        """Exactly fittable input, so anything above rounding is a real offset."""
+        self.assertLess(self.worst_error(self.assembly()), 0.01)
+
+    def test_a_legend_does_not_displace_the_map(self):
+        self.assertLess(self.worst_error(self.assembly(with_legend=True)), 0.01)
+
+    def test_the_canvas_minimising_rotation_stays_out_of_the_points(self):
+        """It depends on every other piece, so points must not go through it."""
+        pieces = self.assembly()
+        before = canvas_gcps(pieces)
+        stray = make_piece(400, 300, name="page_0009.png")
+        stray.x, stray.y, stray.rotation_deg = 5000.0, -3000.0, -40.0
+        self.assertEqual(canvas_gcps(pieces + [stray]), before)
+
+
+@needs_qgis
 class TestQgisProject(unittest.TestCase):
     """The project file veloroute's `mix velo.map.image.from_qgis` consumes."""
 
