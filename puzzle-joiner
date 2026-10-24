@@ -16,5 +16,14 @@ import os
 # Add the script's directory to sys.path so the package can be imported
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from puzzle_joiner.__main__ import main
-main()
+# The guard is load-bearing, not decoration. Python 3.14 starts pool workers
+# with forkserver rather than fork, and a forkserver worker re-runs this file
+# by path, under the name "__mp_main__", to rebuild the main module. Calling
+# main() here unconditionally therefore launched a second copy of the whole
+# app inside every worker — a second window, a second import dialog, and then
+# a bootstrapping error from the pool that copy tried to start in its turn.
+# `python -m puzzle_joiner` never showed it: that path re-imports the module by
+# name, and `puzzle_joiner/__main__.py` carries this same guard.
+if __name__ == "__main__":
+    from puzzle_joiner.__main__ import main
+    main()

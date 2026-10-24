@@ -209,3 +209,35 @@ def test_check_deps_reports_missing(monkeypatch):
     assert "sudo apt-get install" in result
     assert "pdfseparate" in result
     assert "convert" in result
+
+
+def _entry_script_path():
+    return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        "puzzle-joiner")
+
+
+def test_entry_points_guard_their_main_call():
+    """Neither entry point may call main() while merely being imported.
+
+    Python 3.14 starts pool workers with forkserver, which rebuilds the main
+    module by re-running it — the launcher by path as "__mp_main__", the
+    package module by name. An unguarded call there starts a second copy of
+    the whole app inside every worker.
+    """
+    import ast
+
+    for path in (_entry_script_path(),
+                 os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                              "puzzle_joiner", "__main__.py")):
+        tree = ast.parse(open(path).read())
+        # Other top-level calls are fine — the launcher has to fix up sys.path
+        # before anything can be imported, re-run or not. Only main() must wait.
+        unguarded = [ast.unparse(node) for node in tree.body
+                     if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call)
+                     and "main" in ast.unparse(node.value.func)]
+        assert unguarded == [], f"{os.path.basename(path)} calls {unguarded} at import"
+
+        guarded = [node for node in tree.body
+                   if isinstance(node, ast.If) and "__main__" in ast.unparse(node.test)
+                   and "main()" in ast.unparse(node)]
+        assert guarded, f"{os.path.basename(path)} never calls main() under a guard"
