@@ -221,6 +221,34 @@ class TestFit(unittest.TestCase):
         self.assertLess(max(georef.residuals(rotated, "Helmert")), 1.0)
         self.assertGreater(max(georef.residuals(rotated, "Linear")), 1.0)
 
+    def test_a_repeated_page_point_is_refused_not_fatal(self):
+        """QGIS' Helmert solver aborts the process on a singular matrix.
+
+        GSL's default error handler calls abort(), so there is no exception to
+        catch — marking one landmark twice would take the app down with every
+        unsaved point in the dialog. It has to be refused before QGIS sees it.
+        """
+        same = [(10.0, 20.0, 1000.0, 2000.0), (10.0, 20.0, 1500.0, 2500.0)]
+        for method in georef.METHODS:
+            with self.subTest(method=method):
+                self.assertIsNone(georef.fit(same, method))
+                self.assertIsNone(georef.residuals(same, method))
+
+    def test_a_repeat_among_enough_other_points_still_fits(self):
+        """Only the distinct count has to clear the minimum."""
+        self.assertIsNotNone(georef.fit(
+            [(10.0, 20.0, 1000.0, 2000.0), (10.0, 20.0, 1000.0, 2000.0),
+             (90.0, 70.0, 1800.0, 1400.0)], "Helmert"))
+
+    def test_a_degenerate_fit_is_no_fit_rather_than_nan(self):
+        """Linear solves two stacked points, then returns NaN for x.
+
+        Reported as a fit, that NaN would reach the export and be written out
+        as a georeference that merely looks real.
+        """
+        stacked = [(10.0, 0.0, 1000.0, 2000.0), (10.0, 100.0, 1000.0, 1900.0)]
+        self.assertIsNone(georef.fit(stacked, "Linear"))
+
     def test_too_few_points_do_not_fit(self):
         self.assertIsNone(georef.fit(self.NORTH_UP[:1], "Helmert"))
         self.assertIsNone(georef.residuals([], "Helmert"))

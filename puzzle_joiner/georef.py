@@ -202,7 +202,16 @@ def fit(gcps, method: str = DEFAULT_METHOD):
     """
     core, analysis = _qgis()
     transformer = analysis.QgsGcpTransformerInterface.create(_method_enum(method))
-    if len(gcps) < transformer.minimumGcpCount():
+    minimum = transformer.minimumGcpCount()
+    if len(gcps) < minimum:
+        return None
+    # Distinct source points, not merely enough of them. Two control points on
+    # the same page pixel make QGIS' Helmert solver hand GSL a singular matrix,
+    # and GSL's default error handler calls abort(): the process dies on the
+    # spot, with no exception for anyone to catch. Marking one landmark twice
+    # instead of deleting a row is an ordinary slip, so it has to be refused
+    # here, before QGIS ever sees the points.
+    if len({(g[0], g[1]) for g in gcps}) < minimum:
         return None
     src = [core.QgsPointXY(g[0], -g[1]) for g in gcps]
     dst = [core.QgsPointXY(g[2], g[3]) for g in gcps]
@@ -214,6 +223,17 @@ def fit(gcps, method: str = DEFAULT_METHOD):
         if not ok:
             raise ValueError("point could not be transformed")
         return tx, ty
+
+    # Distinct but still degenerate — every point on one vertical line, say —
+    # is solved rather than refused, and comes back as NaN. Probe it once, so
+    # a hopeless fit reads as no fit instead of reaching an export, or the
+    # dialog, as a georeference that merely looks real.
+    try:
+        probe = transform(gcps[0][0], gcps[0][1])
+    except ValueError:
+        return None
+    if not all(np.isfinite(value) for value in probe):
+        return None
 
     return transform
 
