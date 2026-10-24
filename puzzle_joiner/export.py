@@ -13,6 +13,9 @@ TILE = 1024
 _BAND_BYTES = 512 << 20
 # Byte budget for the float32 temporaries of a single composite step.
 _CHUNK_BYTES = 64 << 20
+# Threads tifffile may use to deflate tiles. Half the cores leaves room for the
+# band rendering (OpenCV runs its own pool) and keeps the machine usable.
+_ENCODE_WORKERS = max(1, (os.cpu_count() or 2) // 2)
 
 
 def _layer_name(piece: PuzzlePiece) -> str:
@@ -227,6 +230,7 @@ def export_layered_tiff(pieces: list, output_path: str):
                 photometric="rgb",
                 tile=(TILE, TILE),
                 compression="deflate",
+                maxworkers=_ENCODE_WORKERS,
                 extratags=[(285, tifffile.DATATYPE.ASCII, 0, _layer_name(piece), False)],
             )
 
@@ -280,4 +284,5 @@ def export_flattened_tiff(pieces: list, output_path: str):
             photometric="rgb",
             tile=(TILE, TILE),
             compression="deflate",
+            maxworkers=_ENCODE_WORKERS,
         )
