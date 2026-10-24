@@ -173,7 +173,7 @@ def auto_detect_placements(pieces: list):
     # Build data dicts from pieces (use display-res for speed)
     orb_data = []
     for piece in pieces:
-        img = piece.get_cropped_image()
+        img = piece.get_match_image()
         # Use display pixmap resolution for speed
         h, w = img.shape[:2]
         ds = piece.display_scale
@@ -196,8 +196,7 @@ def auto_detect_placements(pieces: list):
     n = len(pieces)
     placed = [False] * n
     placed[0] = True
-    pieces[0].x = pieces[0].get_cropped_image().shape[1] / 2.0
-    pieces[0].y = pieces[0].get_cropped_image().shape[0] / 2.0
+    pieces[0].x, pieces[0].y = (v / 2.0 for v in pieces[0]._cropped_size())
     pieces[0].rotation_deg = 0.0
     pieces[0].scale = 1.0
     pieces[0].is_matched = True
@@ -235,8 +234,7 @@ def auto_detect_placements(pieces: list):
                 # sc in display units: actual scale = sc * ds_j / ds_i
                 sc_world = sc * ds_j / ds_i
 
-                img_j = pieces[j].get_cropped_image()
-                hj, wj = img_j.shape[:2]
+                wj, hj = pieces[j]._cropped_size()
                 # Center of piece j in piece i's local coords
                 cj_local_x = tx_world + (wj / 2.0) * sc_world * math.cos(math.radians(rot)) \
                               - (hj / 2.0) * sc_world * math.sin(math.radians(rot))
@@ -246,8 +244,7 @@ def auto_detect_placements(pieces: list):
                 # Piece i's center in world coords
                 ci_world_x = pieces[i].x
                 ci_world_y = pieces[i].y
-                img_i = pieces[i].get_cropped_image()
-                hi, wi = img_i.shape[:2]
+                wi, hi = pieces[i]._cropped_size()
 
                 # Translate piece i local coords to world
                 rot_i = math.radians(pieces[i].rotation_deg)
@@ -275,15 +272,14 @@ def auto_detect_placements(pieces: list):
             if placed[i]:
                 bb = pieces[i].get_bounding_box()
                 bottom = bb.bottom()
-                h_piece = pieces[i].get_cropped_image().shape[0] * pieces[i].scale
+                h_piece = pieces[i]._cropped_size()[1] * pieces[i].scale
                 if bottom > max_y:
                     max_y = bottom
                     max_h = h_piece
         row_y = max_y + max_h * 0.1 + 100
         row_x = 0.0
         for i in unmatched:
-            img = pieces[i].get_cropped_image()
-            h, w = img.shape[:2]
+            w, h = pieces[i]._cropped_size()
             pieces[i].x = row_x + w / 2.0
             pieces[i].y = row_y + h / 2.0
             pieces[i].rotation_deg = 0.0
@@ -308,7 +304,7 @@ def snap_piece_to_neighbors(piece: "PuzzlePiece", neighbors: list):
     piece_lbl = _piece_label(piece)
     logger.debug("snap %s: start, %d neighbors", piece_lbl, len(neighbors))
 
-    piece_img = piece.get_cropped_image()
+    piece_img = piece.get_match_image()
     ph, pw = piece_img.shape[:2]
 
     best_matrix = None
@@ -332,7 +328,7 @@ def snap_piece_to_neighbors(piece: "PuzzlePiece", neighbors: list):
         if neighbor is piece:
             continue
         nb_lbl = _piece_label(neighbor)
-        neighbor_img = neighbor.get_cropped_image()
+        neighbor_img = neighbor.get_match_image()
         nh, nw = neighbor_img.shape[:2]
 
         # Check actual polygon overlap (not just axis-aligned bounding boxes)

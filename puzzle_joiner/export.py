@@ -25,8 +25,7 @@ def _compute_optimal_rotation(pieces):
     """Find rotation angle (degrees) that minimizes the axis-aligned bounding box."""
     all_corners = []
     for piece in pieces:
-        w, h = piece._cropped_size()
-        corners = np.array([[0, 0], [w, 0], [w, h], [0, h]], dtype=np.float32).reshape(-1, 1, 2)
+        corners = piece.get_outline_points().reshape(-1, 1, 2)
         M = piece.get_affine_matrix()
         transformed = cv2.transform(corners, M.astype(np.float32)).reshape(-1, 2)
         all_corners.append(transformed)
@@ -65,12 +64,16 @@ def _export_affines(pieces):
 
 
 def _piece_bbox(piece, M):
-    """Axis-aligned bounding box (x, y, w, h) for piece under affine M."""
-    w, h = piece._cropped_size()
-    corners = np.array([[0, 0], [w, 0], [w, h], [0, h]], dtype=np.float32).reshape(-1, 1, 2)
+    """Axis-aligned bounding box (x, y, w, h) of a piece's opaque area under affine M."""
+    corners = piece.get_outline_points().reshape(-1, 1, 2)
     transformed = cv2.transform(corners, M.astype(np.float32)).reshape(-1, 2)
     min_xy = transformed.min(axis=0)
     max_xy = transformed.max(axis=0)
+    if piece.lasso_poly is not None:
+        # The lasso's antialiased edge and the bilinear warp both reach about a
+        # pixel past the polygon vertices — keep that fringe inside the canvas.
+        min_xy = min_xy - 1.0
+        max_xy = max_xy + 1.0
     return min_xy[0], min_xy[1], max_xy[0] - min_xy[0], max_xy[1] - min_xy[1]
 
 

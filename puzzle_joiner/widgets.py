@@ -9,9 +9,9 @@ import numpy as np
 from PySide6.QtWidgets import (
     QGraphicsScene, QGraphicsView,
     QGraphicsPixmapItem, QGraphicsItem, QGraphicsRectItem,
-    QGraphicsPathItem,
+    QGraphicsPathItem, QGraphicsEllipseItem,
     QWidget, QHBoxLayout, QVBoxLayout, QScrollArea, QLabel, QPushButton,
-    QDialog, QDialogButtonBox, QLineEdit, QFormLayout,
+    QButtonGroup, QDialog, QDialogButtonBox, QLineEdit, QFormLayout,
     QMenu, QFrame, QGridLayout,
     QAbstractScrollArea, QMessageBox,
 )
@@ -1467,6 +1467,188 @@ class CropRectItem(QGraphicsPathItem):
         self._scene.removeItem(self)
 
 
+_LASSO_HANDLE_SIZE = 9
+_LASSO_CLOSE_DIST = 14   # viewport px within which a click closes the polygon
+
+
+class LassoVertexItem(QGraphicsEllipseItem):
+    """Round knob on a lasso polygon — a vertex, or a midpoint that inserts one.
+
+    Purely visual: `CropView` does the hit-testing and dragging, because moving a
+    point can rebuild the whole handle list and an item holding the mouse grab
+    would be destroyed under itself.
+    """
+
+    def __init__(self, index: int, midpoint: bool = False):
+        hs = _LASSO_HANDLE_SIZE - (2 if midpoint else 0)
+        super().__init__(-hs / 2, -hs / 2, hs, hs)
+        self.index = index
+        self.midpoint = midpoint
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations, True)
+        fill = QColor(255, 255, 255, 110) if midpoint else QColor(255, 255, 255)
+        self.setBrush(QBrush(fill))
+        self.setPen(QPen(QColor(255, 80, 80), 1))
+        self.setZValue(21)
+        self.setCursor(QCursor(Qt.CursorShape.SizeAllCursor))
+        self.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+
+
+class LassoItem(QGraphicsPathItem):
+    """Piecewise-linear lasso: dimmed overlay outside, one draggable knob per point.
+
+    Points live in scene coords, which are image pixels in the crop dialog.
+    """
+
+    def __init__(self, image_rect: QRectF, scene: QGraphicsScene,
+                 points=None, closed=False):
+        super().__init__()
+        self.image_rect = QRectF(image_rect)
+        self.points = [self._clamp(QPointF(*p) if isinstance(p, tuple) else QPointF(p))
+                       for p in (points or [])]
+        self.closed = closed
+        self._cursor_point = None   # rubber-band target while still drawing
+        self._scene = scene
+        scene.addItem(self)
+        self.setZValue(5)
+        self.setPen(QPen(Qt.PenStyle.NoPen))
+        self.setBrush(QBrush(QColor(0, 0, 0, 120)))
+        self.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+
+        self._outline = QGraphicsPathItem(self)
+        pen = QPen(QColor(255, 80, 80), 2)
+        pen.setStyle(Qt.PenStyle.DashLine)
+        pen.setCosmetic(True)
+        self._outline.setPen(pen)
+        self._outline.setBrush(QBrush(Qt.BrushStyle.NoBrush))
+        self._outline.setZValue(6)
+
+        self.handles = []
+        self._rebuild_handles()
+
+    # --- geometry ---
+
+    def _clamp(self, p: QPointF) -> QPointF:
+        r = self.image_rect
+        return QPointF(min(max(p.x(), r.left()), r.right()),
+                       min(max(p.y(), r.top()), r.bottom()))
+
+    def polygon(self) -> list:
+        return [(p.x(), p.y()) for p in self.points]
+
+    def bounding_rect(self) -> QRectF:
+        xs = [p.x() for p in self.points]
+        ys = [p.y() for p in self.points]
+        return QRectF(QPointF(min(xs), min(ys)), QPointF(max(xs), max(ys)))
+
+    def first_point(self) -> Optional[QPointF]:
+        return self.points[0] if self.points else None
+
+    # --- editing ---
+
+    def add_point(self, pos: QPointF):
+        p = self._clamp(pos)
+        # A double-click to close arrives after a plain press, so drop the
+        # duplicate point it would otherwise leave behind.
+        if self.points and (self.points[-1] - p).manhattanLength() < 1.0:
+            return
+        self.points.append(p)
+        self._rebuild_handles()
+
+    def insert_point(self, after_index: int, pos: QPointF) -> int:
+        idx = after_index + 1
+        self.points.insert(idx, self._clamp(pos))
+        self._rebuild_handles()
+        return idx
+
+    def set_point(self, index: int, pos: QPointF):
+        if 0 <= index < len(self.points):
+            self.points[index] = self._clamp(pos)
+            self._update_shape()
+
+    def remove_point(self, index: int):
+        if len(self.points) > 3 and 0 <= index < len(self.points):
+            del self.points[index]
+            self._rebuild_handles()
+
+    def pop_point(self):
+        if self.points:
+            self.points.pop()
+            self._rebuild_handles()
+
+    def close_shape(self) -> bool:
+        if len(self.points) < 3:
+            return False
+        self.closed = True
+        self._cursor_point = None
+        self._rebuild_handles()
+        return True
+
+    def set_cursor_point(self, pos: Optional[QPointF]):
+        if self.closed:
+            return
+        self._cursor_point = QPointF(pos) if pos is not None else None
+        self._update_shape()
+
+    # --- drawing ---
+
+    def _rebuild_handles(self):
+        """Match the handle items to the point list, then reposition everything."""
+        wanted = [(i, False) for i in range(len(self.points))]
+        if self.closed:
+            wanted += [(i, True) for i in range(len(self.points))]
+        for h in self.handles:
+            self._scene.removeItem(h)
+        self.handles = []
+        for index, midpoint in wanted:
+            h = LassoVertexItem(index, midpoint)
+            self._scene.addItem(h)
+            self.handles.append(h)
+        self._update_shape()
+
+    def _update_shape(self):
+        # Dim everything outside the polygon — only meaningful once closed.
+        overlay = QPainterPath()
+        if self.closed and len(self.points) >= 3:
+            outer = QPainterPath()
+            outer.addRect(self.image_rect)
+            overlay = outer.subtracted(self._polygon_path())
+        self.setPath(overlay)
+
+        outline = QPainterPath()
+        if self.points:
+            outline.moveTo(self.points[0])
+            for p in self.points[1:]:
+                outline.lineTo(p)
+            if self.closed and len(self.points) >= 3:
+                outline.closeSubpath()
+            elif self._cursor_point is not None:
+                outline.lineTo(self._cursor_point)
+        self._outline.setPath(outline)
+
+        n = len(self.points)
+        for h in self.handles:
+            if h.midpoint:
+                a = self.points[h.index]
+                b = self.points[(h.index + 1) % n]
+                h.setPos((a + b) / 2.0)
+            else:
+                h.setPos(self.points[h.index])
+
+    def _polygon_path(self) -> QPainterPath:
+        path = QPainterPath()
+        path.moveTo(self.points[0])
+        for p in self.points[1:]:
+            path.lineTo(p)
+        path.closeSubpath()
+        return path
+
+    def remove_from_scene(self):
+        for h in self.handles:
+            self._scene.removeItem(h)
+        self.handles = []
+        self._scene.removeItem(self)
+
+
 class CropView(QGraphicsView):
     """Zoomable/pannable view for the crop dialog."""
 
@@ -1476,17 +1658,34 @@ class CropView(QGraphicsView):
         self.setDragMode(QGraphicsView.DragMode.NoDrag)
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
         self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.viewport().setMouseTracking(True)
         self._panning = False
         self._pan_start = None
         self._zoom = 1.0
-        self._mode = None  # "draw", "move", or None
+        self._mode = None  # "draw", "move", "lasso_vertex", or None
         self._drag_start = None
         self._move_start_rect = None
+        self._lasso_index = None
+        self.tool = "rect"  # "rect" or "lasso"
         self.crop_rect_item: CropRectItem | None = None
+        self.lasso_item: LassoItem | None = None
         self._image_rect = QRectF()
 
     def set_image_rect(self, r: QRectF):
         self._image_rect = QRectF(r)
+
+    def set_tool(self, tool: str):
+        """Switch tools, discarding the other tool's region — only one can apply."""
+        if tool == self.tool:
+            return
+        self.tool = tool
+        if tool == "lasso" and self.crop_rect_item is not None:
+            self.crop_rect_item.remove_from_scene()
+            self.crop_rect_item = None
+        elif tool == "rect" and self.lasso_item is not None:
+            self.lasso_item.remove_from_scene()
+            self.lasso_item = None
 
     def wheelEvent(self, event):
         delta = event.angleDelta().y()
@@ -1505,12 +1704,80 @@ class CropView(QGraphicsView):
                 return True
         return False
 
+    def _hit_lasso_handle(self, event_pos):
+        """Return the lasso knob under a viewport pos, or None."""
+        for item in self.items(event_pos):
+            if isinstance(item, LassoVertexItem):
+                return item
+        return None
+
+    def _near_first_point(self, event_pos) -> bool:
+        """True when a viewport pos is close enough to the first vertex to close."""
+        first = self.lasso_item.first_point() if self.lasso_item else None
+        if first is None:
+            return False
+        delta = self.mapFromScene(first) - event_pos
+        return delta.manhattanLength() <= _LASSO_CLOSE_DIST
+
+    def _lasso_press(self, event):
+        scene_pos = self.mapToScene(event.pos())
+        lasso = self.lasso_item
+        if lasso is None:
+            self.lasso_item = LassoItem(self._image_rect, self.scene())
+            self.lasso_item.add_point(scene_pos)
+        elif (not lasso.closed and len(lasso.points) >= 3
+                and self._near_first_point(event.pos())):
+            # Checked before the knobs: the first vertex has one sitting on it,
+            # and closing the shape is what a click there means.
+            lasso.close_shape()
+        elif (handle := self._hit_lasso_handle(event.pos())) is not None:
+            index = handle.index
+            if handle.midpoint:
+                index = lasso.insert_point(index, scene_pos)
+            self._mode = "lasso_vertex"
+            self._lasso_index = index
+        elif not lasso.closed:
+            lasso.add_point(scene_pos)
+        event.accept()
+
+    def mouseDoubleClickEvent(self, event):
+        if (self.tool == "lasso" and event.button() == Qt.MouseButton.LeftButton
+                and self.lasso_item is not None and not self.lasso_item.closed):
+            self.lasso_item.close_shape()
+            event.accept()
+        else:
+            super().mouseDoubleClickEvent(event)
+
+    def keyPressEvent(self, event):
+        if self.tool == "lasso" and self.lasso_item is not None:
+            key = event.key()
+            if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                if self.lasso_item.close_shape():
+                    event.accept()
+                    return
+            elif key == Qt.Key.Key_Backspace and not self.lasso_item.closed:
+                self.lasso_item.pop_point()
+                if not self.lasso_item.points:
+                    self.lasso_item.remove_from_scene()
+                    self.lasso_item = None
+                event.accept()
+                return
+        super().keyPressEvent(event)
+
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.MiddleButton:
             self._panning = True
             self._pan_start = event.pos()
             self.setCursor(QCursor(Qt.CursorShape.ClosedHandCursor))
             event.accept()
+        elif (self.tool == "lasso" and event.button() == Qt.MouseButton.RightButton
+                and self.lasso_item is not None):
+            handle = self._hit_lasso_handle(event.pos())
+            if handle is not None and not handle.midpoint:
+                self.lasso_item.remove_point(handle.index)
+            event.accept()
+        elif self.tool == "lasso" and event.button() == Qt.MouseButton.LeftButton:
+            self._lasso_press(event)
         elif event.button() == Qt.MouseButton.LeftButton:
             # Let handles take priority
             if self._hit_handle(event.pos()):
@@ -1543,6 +1810,13 @@ class CropView(QGraphicsView):
                 self.verticalScrollBar().value() - delta.y()
             )
             event.accept()
+        elif self._mode == "lasso_vertex" and self.lasso_item is not None:
+            self.lasso_item.set_point(self._lasso_index, self.mapToScene(event.pos()))
+            event.accept()
+        elif self.tool == "lasso":
+            if self.lasso_item is not None:
+                self.lasso_item.set_cursor_point(self.mapToScene(event.pos()))
+            super().mouseMoveEvent(event)
         elif self._mode == "draw" and self._drag_start is not None:
             scene_pos = self.mapToScene(event.pos())
             r = QRectF(self._drag_start, scene_pos).normalized()
@@ -1580,6 +1854,7 @@ class CropView(QGraphicsView):
             self._mode = None
             self._drag_start = None
             self._move_start_rect = None
+            self._lasso_index = None
             self.setCursor(QCursor(Qt.CursorShape.ArrowCursor))
             event.accept()
         else:
@@ -1603,6 +1878,9 @@ class CutToolDialog(QDialog):
         img = piece.image  # full uncropped image
         h, w = img.shape[:2]
         rgba = cv2.cvtColor(img, cv2.COLOR_BGRA2RGBA)
+        if piece._base_alpha is not None:
+            # Show the image unmasked so an existing lasso can be pushed outwards.
+            rgba[:, :, 3] = piece._base_alpha
         qimg = QImage(rgba.data, rgba.shape[1], rgba.shape[0], rgba.strides[0],
                       QImage.Format.Format_RGBA8888)
         pm = QPixmap.fromImage(qimg.copy())
@@ -1612,18 +1890,41 @@ class CutToolDialog(QDialog):
         self.scene.setSceneRect(image_rect)
         self.view.set_image_rect(image_rect)
 
-        # Initialize crop rect from piece (or full image)
-        if piece.crop_rect:
-            cx, cy, cw, ch = piece.crop_rect
-            crop_r = QRectF(cx, cy, cw, ch)
-        else:
-            crop_r = QRectF(image_rect)
+        # Results the caller reads after Accepted; the dialog never touches the piece.
+        self.result_crop_rect = piece.crop_rect
+        self.result_lasso_poly = piece.lasso_poly
 
-        self.view.crop_rect_item = CropRectItem(crop_r, image_rect, self.scene)
+        # Restore whichever region the piece already carries
+        if piece.lasso_poly:
+            self.view.tool = "lasso"
+            self.view.lasso_item = LassoItem(
+                image_rect, self.scene, points=piece.lasso_poly, closed=True)
+        else:
+            if piece.crop_rect:
+                cx, cy, cw, ch = piece.crop_rect
+                crop_r = QRectF(cx, cy, cw, ch)
+            else:
+                crop_r = QRectF(image_rect)
+            self.view.crop_rect_item = CropRectItem(crop_r, image_rect, self.scene)
 
         self.view.fitInView(self.scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
         t = self.view.transform()
         self.view._zoom = t.m11()
+
+        # Tool selector
+        tools = QHBoxLayout()
+        self.rect_btn = QPushButton("Rectangle")
+        self.lasso_btn = QPushButton("Lasso")
+        self._tool_group = QButtonGroup(self)
+        for btn, name in ((self.rect_btn, "rect"), (self.lasso_btn, "lasso")):
+            btn.setCheckable(True)
+            self._tool_group.addButton(btn)
+            btn.clicked.connect(lambda _checked, n=name: self._set_tool(n))
+            tools.addWidget(btn)
+        self.lasso_btn.setChecked(self.view.tool == "lasso")
+        self.rect_btn.setChecked(self.view.tool == "rect")
+        tools.addStretch(1)
+        layout.addLayout(tools)
 
         # Buttons
         buttons = QHBoxLayout()
@@ -1633,38 +1934,94 @@ class CutToolDialog(QDialog):
         self.apply_btn.clicked.connect(self._apply)
         self.reset_btn.clicked.connect(self._reset)
         self.cancel_btn.clicked.connect(self.reject)
-        buttons.addWidget(self.apply_btn)
-        buttons.addWidget(self.reset_btn)
-        buttons.addWidget(self.cancel_btn)
+        for btn in (self.apply_btn, self.reset_btn, self.cancel_btn):
+            # Enter closes the lasso instead of activating a button.
+            btn.setAutoDefault(False)
+            buttons.addWidget(btn)
         layout.addLayout(buttons)
 
-        self.label = QLabel(
-            "Drag handles to resize crop. Drag inside to move. "
-            "Draw outside to create new region. Middle-click to pan. Scroll to zoom."
-        )
+        self.label = QLabel()
+        self.label.setWordWrap(True)
         layout.addWidget(self.label)
+        self._update_hint()
+        self.view.setFocus()
+
+    _RECT_HINT = ("Drag handles to resize crop. Drag inside to move. "
+                  "Draw outside to create new region.")
+    _LASSO_HINT = ("Click to place points; click the first point, double-click or "
+                   "press Enter to close. Backspace undoes the last point. Drag a "
+                   "point to correct it, drag a small midpoint to add one, "
+                   "right-click a point to delete it.")
+
+    def _update_hint(self):
+        base = self._LASSO_HINT if self.view.tool == "lasso" else self._RECT_HINT
+        self.label.setText(base + " Middle-click to pan. Scroll to zoom.")
+
+    def _set_tool(self, name: str):
+        self.view.set_tool(name)
+        self.rect_btn.setChecked(name == "rect")
+        self.lasso_btn.setChecked(name == "lasso")
+        self._update_hint()
+        self.view.setFocus()
+
+    def _int_crop(self, r: QRectF):
+        """Clip a scene rect to integer image pixel coords, or None if degenerate."""
+        h, w = self.piece.image.shape[:2]
+        cx = max(0, int(math.floor(r.left())))
+        cy = max(0, int(math.floor(r.top())))
+        cw = min(int(math.ceil(r.right())) - cx, w - cx)
+        ch = min(int(math.ceil(r.bottom())) - cy, h - cy)
+        if cw < 2 or ch < 2:
+            return None
+        return (cx, cy, cw, ch)
 
     def _apply(self):
+        if self.view.tool == "lasso":
+            self._apply_lasso()
+        else:
+            self._apply_rect()
+
+    def _apply_rect(self):
         cri = self.view.crop_rect_item
         if cri is None:
-            QMessageBox.warning(self, "No selection", "Please define a crop region first.")
+            self.result_crop_rect = None
+            self.result_lasso_poly = None
+            self.accept()
             return
-        r = cri.crop_rect
-        if r.width() < 2 or r.height() < 2:
+        crop = self._int_crop(cri.crop_rect)
+        if crop is None:
             QMessageBox.warning(self, "Too small", "Crop region is too small.")
             return
-        h, w = self.piece.image.shape[:2]
-        cx = max(0, int(r.left()))
-        cy = max(0, int(r.top()))
-        cw = min(int(r.width()), w - cx)
-        ch = min(int(r.height()), h - cy)
-        if cw > 0 and ch > 0:
-            self.piece.crop_rect = (cx, cy, cw, ch)
+        self.result_crop_rect = crop
+        self.result_lasso_poly = None
+        self.accept()
+
+    def _apply_lasso(self):
+        li = self.view.lasso_item
+        if li is None or not li.points:
+            self.result_crop_rect = None
+            self.result_lasso_poly = None
             self.accept()
+            return
+        if len(li.points) < 3:
+            QMessageBox.warning(self, "Incomplete lasso",
+                                "A lasso needs at least 3 points.")
+            return
+        li.close_shape()
+        crop = self._int_crop(li.bounding_rect())
+        if crop is None:
+            QMessageBox.warning(self, "Too small", "Lasso region is too small.")
+            return
+        self.result_crop_rect = crop
+        self.result_lasso_poly = li.polygon()
+        self.accept()
 
     def _reset(self):
-        self.piece.crop_rect = None
         if self.view.crop_rect_item:
             self.view.crop_rect_item.remove_from_scene()
             self.view.crop_rect_item = None
+        if self.view.lasso_item:
+            self.view.lasso_item.remove_from_scene()
+            self.view.lasso_item = None
+        self.view.setFocus()
         self.accept()

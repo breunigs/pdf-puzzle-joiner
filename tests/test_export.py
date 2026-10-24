@@ -199,6 +199,48 @@ class TestStreamedOutput:
         assert not out.exists()
 
 
+class TestLassoExport:
+    def test_canvas_shrinks_to_the_lasso(self):
+        """A lasso must size the canvas to its hull, not the crop rect."""
+        p = _make_piece(200, 200)
+        p.x, p.y = 100, 100
+        rect_bbox = _union_bbox([p], [p.get_affine_matrix()])
+        # Triangle covering the left half, inside the same crop rect.
+        p.apply_crop((0, 0, 200, 200), [(0, 0), (100, 0), (0, 200)])
+        lasso_bbox = _union_bbox([p], [p.get_affine_matrix()])
+        # Width halves; height is unchanged bar the 1 px fringe pad on each side.
+        assert lasso_bbox[2] == rect_bbox[2] // 2 + 2
+        assert lasso_bbox[3] == rect_bbox[3] + 2
+
+    def test_outside_the_lasso_exports_transparent(self, tmp_path):
+        p = _make_noise_piece(200, 200, seed=7)
+        p.x, p.y = 100, 100
+        p.apply_crop((0, 0, 200, 200), [(0, 0), (190, 0), (0, 190)])
+
+        out = tmp_path / "lasso.tif"
+        export_flattened_tiff([p], str(out))
+        got = tifffile.imread(str(out))
+        ox, oy, _, _ = _union_bbox([p], _export_affines([p]))
+        # Bottom-right corner is outside the triangle; top-left is inside.
+        assert got[int(185 - oy), int(185 - ox), 3] == 0
+        assert got[int(5 - oy), int(5 - ox), 3] == 255
+
+    def test_layered_export_matches_reference(self, tmp_path):
+        p = _make_noise_piece(300, 240, seed=8)
+        p.x, p.y = 150, 120
+        p.rotation_deg = 15
+        p.apply_crop((20, 20, 260, 200), [(20, 20), (280, 40), (200, 220), (40, 180)])
+
+        affines = _export_affines([p])
+        ox, oy, w, h = _union_bbox([p], affines)
+        out = tmp_path / "layered_lasso.tif"
+        export_layered_tiff([p], str(out))
+        with tifffile.TiffFile(str(out)) as tif:
+            assert len(tif.pages) == 1
+            _assert_matches(tif.pages[0].asarray(),
+                            _reference_layer(p, affines[0], ox, oy, w, h))
+
+
 class TestMemoryCheck:
     def test_available_memory_is_plausible(self):
         avail = exp._available_memory()

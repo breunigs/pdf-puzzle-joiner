@@ -73,6 +73,8 @@ def save_layout(cache_dir: str, pieces, snap_pairs=None) -> None:
             "is_matched": piece.is_matched,
             "is_locked": piece.is_locked,
             "crop_rect": list(piece.crop_rect) if piece.crop_rect is not None else None,
+            "lasso_poly": ([list(p) for p in piece.lasso_poly]
+                           if piece.lasso_poly is not None else None),
         })
     data = {"pieces": entries}
     if snap_pairs:
@@ -119,7 +121,9 @@ def load_layout(cache_dir: str, pieces):
         piece.is_locked = e.get("is_locked", False)
         saved_crop = e.get("crop_rect")
         if saved_crop is not None:
-            piece.crop_rect = tuple(saved_crop)
+            # A lasso always carries its bounding box as the crop rect, so it is
+            # restored together with one.
+            piece.apply_crop(saved_crop, e.get("lasso_poly"))
         applied = True
     return applied, raw_snap_pairs
 

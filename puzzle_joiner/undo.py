@@ -156,6 +156,42 @@ class DeleteCommand(QUndoCommand):
             self.post_fn()
 
 
+class CropCommand(QUndoCommand):
+    """Undoable crop/lasso change on a single piece.
+
+    Carries the position too: changing the crop moves the piece's local origin,
+    and the cut tool compensates for that to keep image content at the same
+    world coordinates.
+    """
+
+    def __init__(self, piece, old_crop, old_lasso, old_x, old_y,
+                 new_crop, new_lasso, new_x, new_y, sync_fn=None):
+        super().__init__("Crop")
+        self.piece = piece
+        self.old_crop = old_crop
+        self.old_lasso = old_lasso
+        self.old_x = old_x
+        self.old_y = old_y
+        self.new_crop = new_crop
+        self.new_lasso = new_lasso
+        self.new_x = new_x
+        self.new_y = new_y
+        self.sync_fn = sync_fn
+
+    def _apply(self, crop, lasso, x, y):
+        self.piece.apply_crop(crop, lasso)
+        self.piece.x = x
+        self.piece.y = y
+        if self.sync_fn:
+            self.sync_fn(self.piece)
+
+    def redo(self):
+        self._apply(self.new_crop, self.new_lasso, self.new_x, self.new_y)
+
+    def undo(self):
+        self._apply(self.old_crop, self.old_lasso, self.old_x, self.old_y)
+
+
 class LockCommand(QUndoCommand):
     """Undoable lock/unlock toggle."""
 

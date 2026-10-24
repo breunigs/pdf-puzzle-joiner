@@ -22,9 +22,45 @@ class PuzzlePiece:
         self.rotation_deg: float = 0.0
         self.scale: float = 1.0
         self.crop_rect: Optional[tuple] = None  # (x, y, w, h) local unrotated coords
+        self.lasso_poly: Optional[list] = None  # [(x, y), ...] same space as crop_rect
+        self._base_alpha: Optional[np.ndarray] = None  # alpha before lasso masking
         self.is_matched: bool = False
         self.is_locked: bool = False
         self.layer_index: int = 0
+
+    def apply_crop(self, crop_rect: Optional[tuple], lasso_poly: Optional[list] = None):
+        """Set the crop rect and optional lasso polygon, refreshing the alpha mask.
+
+        Polygon points are in full-image (uncropped, unrotated) pixel coords — the
+        same space as crop_rect, which should hold the polygon's bounding box so
+        that all the rect-based geometry stays valid.
+        """
+        self.crop_rect = tuple(crop_rect) if crop_rect is not None else None
+        self.lasso_poly = ([(float(x), float(y)) for x, y in lasso_poly]
+                           if lasso_poly else None)
+        self.refresh_lasso_mask()
+
+    def refresh_lasso_mask(self):
+        """Rewrite the image's alpha so only pixels inside the lasso are opaque.
+
+        The mask is folded into `image` itself rather than a masked copy, so
+        `get_cropped_view()` stays zero-copy. `_base_alpha` keeps the original
+        channel — an imported PNG may carry real transparency — which also makes
+        the mask recomputable, so repeated vertex edits never degrade pixels.
+        """
+        if self.image is None:
+            return
+        if self.lasso_poly is None:
+            if self._base_alpha is not None:
+                self.image[:, :, 3] = self._base_alpha
+                self._base_alpha = None
+            return
+        if self._base_alpha is None:
+            self._base_alpha = self.image[:, :, 3].copy()
+        mask = np.zeros(self.image.shape[:2], dtype=np.uint8)
+        pts = np.round(np.array(self.lasso_poly, dtype=np.float64)).astype(np.int32)
+        cv2.fillPoly(mask, [pts], 255, lineType=cv2.LINE_AA)
+        self.image[:, :, 3] = np.minimum(self._base_alpha, mask)
 
     def get_cropped_image(self) -> np.ndarray:
         if self.crop_rect is not None:
@@ -40,6 +76,36 @@ class PuzzlePiece:
             cx, cy, cw, ch = self.crop_rect
             return self.image[cy:cy+ch, cx:cx+cw]
         return self.image
+
+    def get_match_image(self) -> np.ndarray:
+        """Rect-cropped image with the lasso mask lifted off the alpha channel.
+
+        Matching deliberately ignores the lasso and works on the polygon's
+        bounding rect, so a roughly drawn outline cannot starve a pair of the
+        overlap it needs to match.
+        """
+        if self._base_alpha is None:
+            return self.get_cropped_image()
+        img = self.get_cropped_view().copy()
+        if self.crop_rect is not None:
+            cx, cy, cw, ch = self.crop_rect
+            img[:, :, 3] = self._base_alpha[cy:cy+ch, cx:cx+cw]
+        else:
+            img[:, :, 3] = self._base_alpha
+        return img
+
+    def get_outline_points(self) -> np.ndarray:
+        """Opaque extent in piece-local (cropped) coords, as an Nx2 float32 array.
+
+        The lasso polygon when one is set, else the four crop-rect corners. Lets
+        the export size its canvas to the pixels that actually show.
+        """
+        w, h = self._cropped_size()
+        if self.lasso_poly is None:
+            return np.array([[0, 0], [w, 0], [w, h], [0, h]], dtype=np.float32)
+        ox, oy = self.crop_rect[:2] if self.crop_rect is not None else (0, 0)
+        pts = np.array(self.lasso_poly, dtype=np.float32) - np.array([ox, oy], np.float32)
+        return np.clip(pts, [0, 0], [w, h])
 
     def _cropped_size(self):
         """Return (w, h) of the cropped image without copying pixel data."""

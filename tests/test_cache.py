@@ -103,6 +103,33 @@ class TestSaveLoadLayout:
         assert restored[1].x == 300
         assert restored[1].y == 400
 
+    def test_lasso_round_trip(self, tmp_path):
+        """A lasso and its bounding crop rect are restored together, mask included."""
+        import numpy as np
+        piece = _make_piece("/cache/page_0001.png")
+        piece.image[:, :, 3] = 255
+        piece.apply_crop((0, 0, 10, 10), [(0, 0), (10, 0), (0, 10)])
+        save_layout(str(tmp_path), [piece])
+
+        restored = [_make_piece("/cache/page_0001.png")]
+        restored[0].image[:, :, 3] = 255
+        applied, _ = load_layout(str(tmp_path), restored)
+        assert applied
+        assert restored[0].crop_rect == (0, 0, 10, 10)
+        assert restored[0].lasso_poly == [(0.0, 0.0), (10.0, 0.0), (0.0, 10.0)]
+        assert restored[0].image[9, 9, 3] == 0
+        assert restored[0].image[0, 0, 3] == 255
+
+    def test_rect_crop_clears_a_stale_lasso(self, tmp_path):
+        piece = _make_piece("/cache/page_0001.png", crop_rect=(1, 2, 3, 4))
+        save_layout(str(tmp_path), [piece])
+
+        restored = [_make_piece("/cache/page_0001.png")]
+        restored[0].apply_crop((0, 0, 10, 10), [(0, 0), (10, 0), (0, 10)])
+        load_layout(str(tmp_path), restored)
+        assert restored[0].crop_rect == (1, 2, 3, 4)
+        assert restored[0].lasso_poly is None
+
     def test_no_layout_file(self, tmp_path):
         pieces = [_make_piece("/cache/page_0001.png")]
         applied, snap_pairs = load_layout(str(tmp_path), pieces)

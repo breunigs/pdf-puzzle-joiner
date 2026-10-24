@@ -33,7 +33,10 @@ from .widgets import (
     PuzzleScene, PuzzleView, ThumbnailPanel,
     PdfImportDialog, CutToolDialog,
 )
-from .undo import TransformCommand, SnapCommand, SnapAllCommand, DeleteCommand, LockCommand
+from .undo import (
+    TransformCommand, SnapCommand, SnapAllCommand, DeleteCommand, LockCommand,
+    CropCommand,
+)
 
 
 class MainWindow(QMainWindow):
@@ -638,38 +641,54 @@ class MainWindow(QMainWindow):
             self.status_bar.showMessage("Select a piece first.")
             return
         old_crop = piece.crop_rect
+        old_lasso = piece.lasso_poly
         dlg = CutToolDialog(piece, self)
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            new_crop = piece.crop_rect
-            # Adjust position so the same image content stays at the same
-            # world coordinates (critical for preserving snap alignment).
-            if old_crop != new_crop:
-                h, w = piece.image.shape[:2]
-                if old_crop:
-                    ocx, ocy, ocw, och = old_crop
-                    old_cx = ocx + ocw / 2.0
-                    old_cy = ocy + och / 2.0
-                else:
-                    old_cx, old_cy = w / 2.0, h / 2.0
-                if new_crop:
-                    ncx, ncy, ncw, nch = new_crop
-                    new_cx = ncx + ncw / 2.0
-                    new_cy = ncy + nch / 2.0
-                else:
-                    new_cx, new_cy = w / 2.0, h / 2.0
-                dx = new_cx - old_cx
-                dy = new_cy - old_cy
-                cos_a = math.cos(math.radians(piece.rotation_deg))
-                sin_a = math.sin(math.radians(piece.rotation_deg))
-                piece.x += piece.scale * (cos_a * dx - sin_a * dy)
-                piece.y += piece.scale * (sin_a * dx + cos_a * dy)
-            item = self.scene.piece_items.get(piece)
-            if item:
-                item.rebuild_pixmap()
-            piece.rebuild_thumbnail()
-            self.thumbnail_panel.update_piece(piece)
-            self._auto_save_layout()
-            self.status_bar.showMessage("Crop applied.")
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        new_crop = dlg.result_crop_rect
+        new_lasso = dlg.result_lasso_poly
+        if old_crop == new_crop and old_lasso == new_lasso:
+            return
+        new_x, new_y = piece.x, piece.y
+        # Adjust position so the same image content stays at the same
+        # world coordinates (critical for preserving snap alignment).
+        if old_crop != new_crop:
+            h, w = piece.image.shape[:2]
+            if old_crop:
+                ocx, ocy, ocw, och = old_crop
+                old_cx = ocx + ocw / 2.0
+                old_cy = ocy + och / 2.0
+            else:
+                old_cx, old_cy = w / 2.0, h / 2.0
+            if new_crop:
+                ncx, ncy, ncw, nch = new_crop
+                new_cx = ncx + ncw / 2.0
+                new_cy = ncy + nch / 2.0
+            else:
+                new_cx, new_cy = w / 2.0, h / 2.0
+            dx = new_cx - old_cx
+            dy = new_cy - old_cy
+            cos_a = math.cos(math.radians(piece.rotation_deg))
+            sin_a = math.sin(math.radians(piece.rotation_deg))
+            new_x += piece.scale * (cos_a * dx - sin_a * dy)
+            new_y += piece.scale * (sin_a * dx + cos_a * dy)
+        self.undo_stack.push(CropCommand(
+            piece, old_crop, old_lasso, piece.x, piece.y,
+            new_crop, new_lasso, new_x, new_y,
+            sync_fn=self._sync_cropped_piece,
+        ))
+        self.status_bar.showMessage("Crop applied.")
+
+    def _sync_cropped_piece(self, piece):
+        """Refresh everything that caches a piece's cropped pixels."""
+        item = self.scene.piece_items.get(piece)
+        if item:
+            item.rebuild_pixmap()
+        else:
+            piece.rebuild_display_pixmap()
+        piece.rebuild_thumbnail()
+        self.thumbnail_panel.update_piece(piece)
+        self._auto_save_layout()
 
     # --- Lock/Unlock ---
 
