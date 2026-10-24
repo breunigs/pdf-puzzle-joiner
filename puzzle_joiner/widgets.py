@@ -2758,6 +2758,14 @@ class ExportOptionsDialog(QDialog):
         self.ok_button = buttons.button(QDialogButtonBox.StandardButton.Ok)
         layout.addWidget(buttons)
 
+        if not any(box.isChecked() for box in self._all_boxes()):
+            # A selection remembered from a georeferenced document leaves every
+            # ordinary box explicitly off, so reopening it on one without
+            # control points would tick nothing and grey out OK. Fall back.
+            for key in defaults:
+                if key != "warp":
+                    self.boxes[key].setChecked(True)
+
         for box in self._all_boxes():
             box.toggled.connect(self._sync_ok)
         if not can_warp:

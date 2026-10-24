@@ -29,7 +29,7 @@ from .cache import (
 from .matching import auto_detect_placements, snap_piece_to_neighbors
 from .export import (
     export_layered_tiff, export_flattened_tiff, canvas_gcps, export_geotiff,
-    write_qgis_project,
+    georef_transform, write_qgis_project,
 )
 from .legend import make_legend_piece, clone_legend_piece
 from . import georef
@@ -872,10 +872,18 @@ class MainWindow(QMainWindow):
             return
         gcps = canvas_gcps(self.pieces) if georef.available() else []
         method = self._georef_method
+        can_warp = False
+        if gcps:
+            # Starting QGIS here also settles whether the points can be fitted
+            # at all — too few of them, or all in one spot, and there is no
+            # transform. Offering a file that cannot be written would mean an
+            # export that quietly produces nothing.
+            georef.initialize()
+            can_warp = georef_transform(gcps, method) is not None
 
         # What to write is asked before where to put it, so backing out of the
         # choice costs nothing and the file dialog is the last step.
-        dlg = ExportOptionsDialog(bool(gcps), self._export_options, self)
+        dlg = ExportOptionsDialog(can_warp, self._export_options, self)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
         options = self._export_options = dlg.result_options
@@ -896,10 +904,6 @@ class MainWindow(QMainWindow):
         # Beside the raster, because the import task resolves the
         # layer source against the project's own directory.
         project_path = f"{base}_warped.qgs"
-        if options["warp"]:
-            # QGIS has to be started from the GUI thread, and the warp runs off
-            # it — so get that out of the way before the export begins.
-            georef.initialize()
 
         def task(progress):
             written = []
@@ -930,7 +934,11 @@ class MainWindow(QMainWindow):
             return tuple(written)
 
         def on_done(paths):
-            self.status_bar.showMessage("Exported: " + ", ".join(paths))
+            # An export that writes nothing used to report an empty list, which
+            # reads as success. Say so instead.
+            self.status_bar.showMessage(
+                "Exported: " + ", ".join(paths) if paths
+                else "Nothing was exported.")
 
         self._run_with_progress("Exporting", task, on_done=on_done)
 
