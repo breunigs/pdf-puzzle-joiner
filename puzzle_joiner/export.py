@@ -7,6 +7,13 @@ import tifffile
 
 from .model import PuzzlePiece
 
+TILE = 1024
+# Byte budget for one horizontal band of the canvas. Bands are rendered and
+# streamed out one at a time so the full canvas never has to fit in RAM.
+_BAND_BYTES = 512 << 20
+# Byte budget for the float32 temporaries of a single composite step.
+_CHUNK_BYTES = 64 << 20
+
 
 def _layer_name(piece: PuzzlePiece) -> str:
     """Derive a human-readable layer name (7-bit ASCII for TIFF compat)."""
@@ -80,29 +87,131 @@ def _union_bbox(pieces, affines):
     return min_x, min_y, int(math.ceil(max_x - min_x)), int(math.ceil(max_y - min_y))
 
 
+def _canvas_bbox(piece, M, origin_x, origin_y, canvas_w, canvas_h):
+    """Integer canvas-space bbox (x0, y0, x1, y1) of a piece, clipped to the canvas."""
+    bx_f, by_f, bw_f, bh_f = _piece_bbox(piece, M)
+    x0 = max(0, int(math.floor(bx_f - origin_x)))
+    y0 = max(0, int(math.floor(by_f - origin_y)))
+    x1 = min(canvas_w, int(math.ceil(bx_f + bw_f - origin_x)))
+    y1 = min(canvas_h, int(math.ceil(by_f + bh_f - origin_y)))
+    return x0, y0, x1, y1
+
+
+def _band_height(canvas_w: int) -> int:
+    """Rows per band: a whole number of tile rows that fits the band budget."""
+    tile_rows = max(1, _BAND_BYTES // max(1, canvas_w * 4 * TILE))
+    return tile_rows * TILE
+
+
+def _warp_region(piece, M, origin_x, origin_y, x0, y0, w, h):
+    """Warp a piece into a (h, w) BGRA buffer whose top-left is canvas (x0, y0)."""
+    M_local = M.copy()
+    M_local[0, 2] -= origin_x + x0
+    M_local[1, 2] -= origin_y + y0
+    return cv2.warpAffine(
+        piece.get_cropped_view(), M_local, (w, h),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=(0, 0, 0, 0),
+    )
+
+
+def _alpha_composite(dst, src):
+    """Alpha-composite src over dst in place, in row chunks to bound temporaries."""
+    h, w = dst.shape[:2]
+    rows = max(1, _CHUNK_BYTES // max(1, w * 4 * 4))
+    for y in range(0, h, rows):
+        s = src[y:y + rows]
+        if not s[:, :, 3].any():
+            continue
+        d = dst[y:y + rows]
+        alpha = s[:, :, 3:4].astype(np.float32) / 255.0
+        d[:] = np.clip(
+            s.astype(np.float32) * alpha + d.astype(np.float32) * (1.0 - alpha),
+            0, 255,
+        ).astype(np.uint8)
+
+
+def _band_tiles(band, band_x, canvas_w):
+    """Yield one tile row as RGBA; band covers canvas columns [band_x, band_x + width).
+
+    Converting at tile granularity keeps the colour swap off the band-sized buffer.
+    Tile positions the band does not reach are emitted as fully transparent tiles.
+    """
+    band_to = band_x + band.shape[1] if band is not None else 0
+    for x in range(0, canvas_w, TILE):
+        if band is None or x >= band_to or x + TILE <= band_x:
+            yield np.zeros((TILE, TILE, 4), dtype=np.uint8)
+        elif x >= band_x and x + TILE <= band_to:
+            yield cv2.cvtColor(band[:, x - band_x:x - band_x + TILE], cv2.COLOR_BGRA2RGBA)
+        else:
+            # Tile straddles the edge of the band — pad the uncovered columns.
+            tile = np.zeros((band.shape[0], TILE, 4), dtype=np.uint8)
+            lo, hi = max(x, band_x), min(x + TILE, band_to)
+            tile[:, lo - x:hi - x] = band[:, lo - band_x:hi - band_x]
+            yield cv2.cvtColor(tile, cv2.COLOR_BGRA2RGBA)
+
+
+def _flattened_tiles(pieces, affines, origin_x, origin_y, canvas_w, canvas_h):
+    """Stream the composited canvas as RGBA tiles, one band of rows at a time."""
+    boxes = [_canvas_bbox(p, M, origin_x, origin_y, canvas_w, canvas_h)
+             for p, M in zip(pieces, affines)]
+    band_h = _band_height(canvas_w)
+    for band_y in range(0, canvas_h, band_h):
+        bh = min(band_h, canvas_h - band_y)
+        # Only the columns some piece reaches in these rows need a buffer.
+        rows = [(p, M, b) for p, M, b in zip(pieces, affines, boxes)
+                if b[0] < b[2] and max(b[1], band_y) < min(b[3], band_y + bh)]
+        if not rows:
+            yield from _band_tiles(None, 0, canvas_w)
+            continue
+        band_x = min(b[0] for _, _, b in rows)
+        band_w = max(b[2] for _, _, b in rows) - band_x
+        band = np.zeros((bh, band_w, 4), dtype=np.uint8)
+        for piece, M, (x0, y0, x1, y1) in rows:
+            ry0 = max(y0, band_y)
+            ry1 = min(y1, band_y + bh)
+            warped = _warp_region(piece, M, origin_x, origin_y,
+                                  x0, ry0, x1 - x0, ry1 - ry0)
+            _alpha_composite(
+                band[ry0 - band_y:ry1 - band_y, x0 - band_x:x1 - band_x], warped)
+            del warped
+        yield from _band_tiles(band, band_x, canvas_w)
+        del band
+
+
+def _layer_tiles(piece, M, origin_x, origin_y, canvas_w, canvas_h):
+    """Stream one piece as RGBA tiles over the full canvas, rendering only its bbox."""
+    x0, y0, x1, y1 = _canvas_bbox(piece, M, origin_x, origin_y, canvas_w, canvas_h)
+    for band_y in range(0, canvas_h, TILE):
+        bh = min(TILE, canvas_h - band_y)
+        ry0 = max(y0, band_y)
+        ry1 = min(y1, band_y + bh)
+        if ry1 <= ry0 or x1 <= x0:
+            yield from _band_tiles(None, 0, canvas_w)
+            continue
+        band = np.zeros((bh, x1 - x0, 4), dtype=np.uint8)
+        band[ry0 - band_y:ry1 - band_y] = _warp_region(
+            piece, M, origin_x, origin_y, x0, ry0, x1 - x0, ry1 - ry0)
+        yield from _band_tiles(band, x0, canvas_w)
+        del band
+
+
 def export_layered_tiff(pieces: list, output_path: str):
     if not pieces:
         return
     affines = _export_affines(pieces)
     origin_x, origin_y, canvas_w, canvas_h = _union_bbox(pieces, affines)
+    _check_memory(canvas_w, TILE)
 
     with tifffile.TiffWriter(output_path, bigtiff=True) as tiff:
         for piece, M in zip(pieces, affines):
-            M = M.copy()
-            M[0, 2] -= origin_x
-            M[1, 2] -= origin_y
-            img = piece.get_cropped_image()
-            warped = cv2.warpAffine(
-                img, M, (canvas_w, canvas_h),
-                flags=cv2.INTER_LINEAR,
-                borderMode=cv2.BORDER_CONSTANT,
-                borderValue=(0, 0, 0, 0),
-            )
-            warped_rgba = cv2.cvtColor(warped, cv2.COLOR_BGRA2RGBA)
             tiff.write(
-                warped_rgba,
+                _layer_tiles(piece, M, origin_x, origin_y, canvas_w, canvas_h),
+                shape=(canvas_h, canvas_w, 4),
+                dtype=np.uint8,
                 photometric="rgb",
-                tile=(1024, 1024),
+                tile=(TILE, TILE),
                 compression="deflate",
                 extratags=[(285, tifffile.DATATYPE.ASCII, 0, _layer_name(piece), False)],
             )
@@ -129,58 +238,32 @@ def _available_memory() -> int:
     return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_AVPHYS_PAGES")
 
 
+def _check_memory(canvas_w: int, band_h: int):
+    """Guard against a canvas so wide that even a single band will not fit."""
+    # One band, plus the warp buffer for a piece spanning it, plus composite chunks.
+    needed = 2 * canvas_w * band_h * 4 + 6 * _CHUNK_BYTES
+    avail = _available_memory()
+    if needed > avail * 0.8:
+        raise MemoryError(
+            f"Export needs {needed / 1024**3:.1f} GB to render a "
+            f"{canvas_w} px wide strip but only {avail / 1024**3:.1f} GB "
+            f"of RAM is available."
+        )
+
+
 def export_flattened_tiff(pieces: list, output_path: str):
     if not pieces:
         return
     affines = _export_affines(pieces)
     origin_x, origin_y, canvas_w, canvas_h = _union_bbox(pieces, affines)
+    _check_memory(canvas_w, _band_height(canvas_w))
 
-    canvas_bytes = canvas_h * canvas_w * 4
-    avail = _available_memory()
-    if canvas_bytes > avail * 0.8:
-        raise MemoryError(
-            f"Flattened export canvas would be {canvas_w} x {canvas_h} "
-            f"({canvas_bytes / 1024**3:.1f} GB) but only "
-            f"{avail / 1024**3:.1f} GB of RAM is available."
+    with tifffile.TiffWriter(output_path, bigtiff=True) as tiff:
+        tiff.write(
+            _flattened_tiles(pieces, affines, origin_x, origin_y, canvas_w, canvas_h),
+            shape=(canvas_h, canvas_w, 4),
+            dtype=np.uint8,
+            photometric="rgb",
+            tile=(TILE, TILE),
+            compression="deflate",
         )
-
-    canvas = np.zeros((canvas_h, canvas_w, 4), dtype=np.uint8)
-
-    for piece, M in zip(pieces, affines):
-        bx_f, by_f, bw_f, bh_f = _piece_bbox(piece, M)
-        bx = max(0, int(math.floor(bx_f - origin_x)))
-        by = max(0, int(math.floor(by_f - origin_y)))
-        bx2 = min(canvas_w, int(math.ceil(bx_f + bw_f - origin_x)))
-        by2 = min(canvas_h, int(math.ceil(by_f + bh_f - origin_y)))
-        bw = bx2 - bx
-        bh = by2 - by
-        if bw <= 0 or bh <= 0:
-            continue
-
-        M_local = M.copy()
-        M_local[0, 2] -= origin_x + bx
-        M_local[1, 2] -= origin_y + by
-        img = piece.get_cropped_image()
-        warped = cv2.warpAffine(
-            img, M_local, (bw, bh),
-            flags=cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_CONSTANT,
-            borderValue=(0, 0, 0, 0),
-        )
-
-        # Alpha composite: warped over canvas region only
-        region = canvas[by:by2, bx:bx2]
-        alpha = warped[:, :, 3:4].astype(np.float32) / 255.0
-        region[:] = np.clip(
-            warped.astype(np.float32) * alpha + region.astype(np.float32) * (1.0 - alpha),
-            0, 255,
-        ).astype(np.uint8)
-
-    canvas_rgba = cv2.cvtColor(canvas, cv2.COLOR_BGRA2RGBA)
-    tifffile.imwrite(
-        output_path,
-        canvas_rgba,
-        photometric="rgb",
-        tile=(1024, 1024),
-        compression="deflate",
-    )

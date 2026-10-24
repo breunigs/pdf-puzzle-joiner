@@ -28,8 +28,17 @@ class PuzzlePiece:
 
     def get_cropped_image(self) -> np.ndarray:
         if self.crop_rect is not None:
+            return self.get_cropped_view().copy()
+        return self.image
+
+    def get_cropped_view(self) -> np.ndarray:
+        """Cropped image as a view on the source buffer — no copy, do not mutate.
+
+        Lets readers (export warps) avoid a full-size copy of the crop.
+        """
+        if self.crop_rect is not None:
             cx, cy, cw, ch = self.crop_rect
-            return self.image[cy:cy+ch, cx:cx+cw].copy()
+            return self.image[cy:cy+ch, cx:cx+cw]
         return self.image
 
     def _cropped_size(self):
