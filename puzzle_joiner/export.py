@@ -19,6 +19,11 @@ _CHUNK_BYTES = 64 << 20
 # room for the band rendering (OpenCV runs its own pool) and keeps the machine
 # usable.
 _ENCODE_WORKERS = max(1, (os.cpu_count() or 2) * 3 // 4)
+# Destination columns a single warp call fills, and the source size beyond
+# which OpenCV's Lanczos path refuses the job (its coordinate maps are short
+# typed, so the real ceiling is SHRT_MAX; this leaves room for the margins).
+_WARP_DST_CHUNK = 8192
+_WARP_SRC_LIMIT = 24000
 
 
 def _layer_name(piece: PuzzlePiece) -> str:
@@ -165,17 +170,67 @@ def _band_height(canvas_w: int) -> int:
     return tile_rows * TILE
 
 
-def _warp_region(piece, M, origin_x, origin_y, x0, y0, w, h):
-    """Warp a piece into a (h, w) BGRA buffer whose top-left is canvas (x0, y0)."""
+def _source_window(src_shape, M_local, w, h):
+    """The box of source pixels that can reach a (w, h) destination.
+
+    Padded by a few pixels so the interpolation kernel has the neighbours it
+    reads, and clipped to the image.
+    """
+    inverse = cv2.invertAffineTransform(M_local)
+    corners = np.array([[0, 0], [w, 0], [w, h], [0, h]],
+                       dtype=np.float32).reshape(-1, 1, 2)
+    back = cv2.transform(corners, inverse).reshape(-1, 2)
+    pad = 4
+    return (max(0, int(math.floor(back[:, 0].min())) - pad),
+            max(0, int(math.floor(back[:, 1].min())) - pad),
+            min(src_shape[1], int(math.ceil(back[:, 0].max())) + pad),
+            min(src_shape[0], int(math.ceil(back[:, 1].max())) + pad))
+
+
+def _warp_region(piece, M, origin_x, origin_y, x0, y0, w, h,
+                 interpolation=cv2.INTER_LINEAR):
+    """Warp a piece into a (h, w) BGRA buffer whose top-left is canvas (x0, y0).
+
+    Only the slice of the source that can actually reach the destination is
+    handed to OpenCV, and the destination is filled a column at a time. Both
+    matter once a plan runs to a few kilometres at 300 dpi: the whole page was
+    otherwise passed for every band of every row it touches, and OpenCV's
+    Lanczos path flatly refuses a source at or past SHRT_MAX on either axis —
+    which a page of this kind reaches on its own.
+    """
+    src = piece.get_cropped_view()
     M_local = M.copy()
     M_local[0, 2] -= origin_x + x0
     M_local[1, 2] -= origin_y + y0
-    return cv2.warpAffine(
-        piece.get_cropped_view(), M_local, (w, h),
-        flags=cv2.INTER_LINEAR,
-        borderMode=cv2.BORDER_CONSTANT,
-        borderValue=(0, 0, 0, 0),
-    )
+    out = np.zeros((h, w, 4), dtype=np.uint8)
+    # A piece drawn smaller than life needs correspondingly more source per
+    # column, so the column shrinks to keep that slice inside the limit.
+    scale = math.sqrt(abs(M[0, 0] * M[1, 1] - M[0, 1] * M[1, 0]))
+    chunk = max(1024, min(_WARP_DST_CHUNK,
+                          int(_WARP_DST_CHUNK * min(1.0, scale))))
+    for cx in range(0, w, chunk):
+        cw = min(chunk, w - cx)
+        M_chunk = M_local.copy()
+        M_chunk[0, 2] -= cx
+        sx0, sy0, sx1, sy1 = _source_window(src.shape, M_chunk, cw, h)
+        if sx1 <= sx0 or sy1 <= sy0:
+            continue
+        # Re-aim the affine at the cropped source's own origin.
+        M_chunk[0, 2] += M_chunk[0, 0] * sx0 + M_chunk[0, 1] * sy0
+        M_chunk[1, 2] += M_chunk[1, 0] * sx0 + M_chunk[1, 1] * sy0
+        flags = interpolation
+        if (interpolation == cv2.INTER_LANCZOS4
+                and max(sx1 - sx0, sy1 - sy0) >= _WARP_SRC_LIMIT):
+            # Nothing reasonable reaches here, but a silently wrong picture is
+            # worse than a slightly softer one: cubic takes any size.
+            flags = cv2.INTER_CUBIC
+        out[:, cx:cx + cw] = cv2.warpAffine(
+            src[sy0:sy1, sx0:sx1], M_chunk, (cw, h),
+            flags=flags,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=(0, 0, 0, 0),
+        )
+    return out
 
 
 def _alpha_composite(dst, src):
@@ -226,7 +281,7 @@ def _row_tiles(row, row_x, canvas_w):
 
 
 def _flattened_tiles(pieces, affines, origin_x, origin_y, canvas_w, canvas_h,
-                     uncropped=False):
+                     uncropped=False, interpolation=cv2.INTER_LINEAR):
     """Stream the composited canvas as RGBA tiles, one band of rows at a time."""
     boxes = [_canvas_bbox(p, M, origin_x, origin_y, canvas_w, canvas_h, uncropped)
              for p, M in zip(pieces, affines)]
@@ -246,7 +301,7 @@ def _flattened_tiles(pieces, affines, origin_x, origin_y, canvas_w, canvas_h,
             ry0 = max(y0, band_y)
             ry1 = min(y1, band_y + bh)
             warped = _warp_region(piece, M, origin_x, origin_y,
-                                  x0, ry0, x1 - x0, ry1 - ry0)
+                                  x0, ry0, x1 - x0, ry1 - ry0, interpolation)
             _alpha_composite(
                 band[ry0 - band_y:ry1 - band_y, x0 - band_x:x1 - band_x], warped)
             del warped

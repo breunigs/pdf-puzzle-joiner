@@ -9,6 +9,7 @@ Python/Qt desktop app for assembling puzzle pieces from scanned PDFs or images. 
 - **OpenCV** for image processing and feature matching
 - **NumPy**, **tifffile** for array manipulation and TIFF export
 - **Poppler** (`pdfseparate`, `pdftocairo`, `pdfinfo`) and **ImageMagick** (`convert`) for PDF handling
+- **System QGIS** (Qt5/PyQt5, optional) for OSM tiles and GCP fitting. The georeferenced export needs no GDAL — it writes the GeoTIFF tags itself. Both are system packages, not wheels; see `georef.py` for how a Qt5 library runs inside this Qt6 app.
 
 ## File Structure
 
@@ -77,6 +78,7 @@ Note the legend body *does* swing when it is uprighted; only the anchor is pinne
 - **Flattened TIFF**: alpha-composite all pieces onto single canvas.
 - **Uncropped flattened TIFF** (`export_flattened_tiff(..., uncropped=True)`): the same composite with every lasso reduced to its bounding rect, written alongside the others as `{name}_uncropped_flat.tif`. `_lassos_lifted` puts each piece's `_base_alpha` back for the duration of the write rather than copying pixels, so the warps stay zero-copy, and `refresh_lasso_mask()` rebuilds the mask afterwards.
 - **One canvas for every file.** `export_canvas` is sized from the crop rects — never from the lasso hulls, which would clip the uncropped file — so all three files come out the same size on the same origin and overlay exactly. That is the point of the uncropped file: georeference it, then swap the lassoed one in for display. Only the interpolation differs, by at most one step, because the two renders hand `warpAffine` different box offsets.
+- `_warp_region` fills the destination a column at a time and crops the source to the window that can actually reach it. Both halves matter at this size: the whole page was otherwise handed to OpenCV for every band it touches, and OpenCV's **Lanczos path refuses a source at or past SHRT_MAX on either axis** — which one page of a 300 dpi plan reaches on its own. Linear and cubic have no such limit, so cubic is the fallback if a source slice ever exceeds it anyway.
 - Per piece, `_piece_bbox` still renders only the area that can show, so a lasso keeps its warp down to the polygon hull. The hull is padded by the piece's scale plus 2 px: `fillPoly` antialiases the mask outside the polygon and the warp spreads that again, and the same pad on the rect box keeps it a superset so the shared canvas clips neither file.
 - `_compute_optimal_rotation` sees map pieces only: a legend is not part of the shape being minimised, and it does not keep the angle it is measured at. `_export_affines` then rides each legend along the global rotation as far as its anchor, re-emits it upright, and runs `separate_legends` to nudge any overlaps apart (all three in `legend.py`); everything downstream is affine-generic and needs no legend case. `export_order` puts legends last so they composite on top.
 

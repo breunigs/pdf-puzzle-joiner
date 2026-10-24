@@ -412,3 +412,70 @@ class TestLayerName:
         result = _layer_name(p)
         assert result.isascii()
         assert result == "?rger.png"
+
+
+class TestChunkedWarp:
+    """`_warp_region` fills the destination in columns from cropped sources.
+
+    Both halves of that matter on a large plan: OpenCV's Lanczos path refuses a
+    source at or past SHRT_MAX on either axis, and handing it the whole page
+    for every band is wasteful even when it is allowed.
+    """
+
+    def _piece(self, rotation=0.0, scale=1.0, w=1700, h=900):
+        rng = np.random.default_rng(7)
+        piece = PuzzlePiece()
+        piece.source_path = "/tmp/chunk.png"
+        piece.image = rng.integers(0, 255, (h, w, 4), dtype=np.uint8)
+        piece.image[:, :, 3] = 255
+        piece.rotation_deg = rotation
+        piece.scale = scale
+        return piece
+
+    def _direct(self, piece, M, origin_x, origin_y, x0, y0, w, h, flags):
+        local = M.copy()
+        local[0, 2] -= origin_x + x0
+        local[1, 2] -= origin_y + y0
+        return cv2.warpAffine(piece.get_cropped_view(), local, (w, h), flags=flags,
+                              borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0, 0))
+
+    @pytest.mark.parametrize("rotation,scale",
+                             [(0.0, 1.0), (17.3, 1.0), (-33.0, 0.8), (5.0, 1.4)])
+    def test_chunking_does_not_change_the_picture(self, rotation, scale, monkeypatch):
+        piece = self._piece(rotation, scale)
+        M = piece.get_affine_matrix()
+        args = (-900.0, -500.0, 10, 20, 2600, 700)
+        direct = self._direct(piece, M, *args, cv2.INTER_LINEAR)
+        monkeypatch.setattr(exp, "_WARP_DST_CHUNK", 512)
+        chunked = exp._warp_region(piece, M, *args, cv2.INTER_LINEAR)
+        # Fixed-point coordinate maps round differently once the source is
+        # re-origined, so a single level of difference is expected; more is not.
+        assert np.abs(direct.astype(int) - chunked.astype(int)).max() <= 1
+
+    def test_the_source_slice_is_bounded_by_the_destination(self):
+        """The whole page must not be handed over for one band of rows."""
+        piece = self._piece(rotation=10.0)
+        M = piece.get_affine_matrix()
+        local = M.copy()
+        local[0, 2] -= -900.0
+        local[1, 2] -= -500.0
+        sx0, sy0, sx1, sy1 = exp._source_window(piece.image.shape, local, 300, 100)
+        assert sx1 - sx0 < 600
+        assert sy1 - sy0 < 400
+
+    def test_a_destination_the_source_cannot_reach_stays_empty(self):
+        piece = self._piece()
+        M = piece.get_affine_matrix()
+        out = exp._warp_region(piece, M, 0.0, 0.0, 90000, 90000, 256, 256)
+        assert out.shape == (256, 256, 4)
+        assert not out.any()
+
+    def test_lanczos_survives_a_source_wider_than_the_short_limit(self, monkeypatch):
+        """The exact failure the georeferenced export hit on a real plan."""
+        monkeypatch.setattr(exp, "_WARP_SRC_LIMIT", 24000)
+        piece = self._piece(rotation=4.0, w=34000, h=700)
+        M = piece.get_affine_matrix()
+        out = exp._warp_region(piece, M, -17000.0, -350.0, 0, 0, 9000, 512,
+                               cv2.INTER_LANCZOS4)
+        assert out.shape == (512, 9000, 4)
+        assert out[:, :, 3].any()
