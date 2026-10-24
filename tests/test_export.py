@@ -452,6 +452,44 @@ class TestChunkedWarp:
         # re-origined, so a single level of difference is expected; more is not.
         assert np.abs(direct.astype(int) - chunked.astype(int)).max() <= 1
 
+    @pytest.mark.parametrize("rotation,scale", [(0.0, 1.0), (17.3, 1.0), (-33.0, 0.8)])
+    def test_lanczos_chunking_stays_within_a_few_levels(self, rotation, scale,
+                                                        monkeypatch):
+        """The interpolation the georeferenced export actually uses.
+
+        Lanczos has a sharper kernel than bilinear, so the sub-1/32-pixel shift
+        from re-origining the source shows up more: a dozen levels on the odd
+        pixel rather than one. Bound it, and bound how many pixels move at all,
+        so a genuine seam or a dropped column cannot hide inside the tolerance.
+        """
+        piece = self._piece(rotation, scale)
+        M = piece.get_affine_matrix()
+        args = (-900.0, -500.0, 10, 20, 2600, 700)
+        direct = self._direct(piece, M, *args, cv2.INTER_LANCZOS4)
+        monkeypatch.setattr(exp, "_WARP_DST_CHUNK", 512)
+        chunked = exp._warp_region(piece, M, *args, cv2.INTER_LANCZOS4)
+        delta = np.abs(direct.astype(int) - chunked.astype(int))
+        assert delta.max() <= 24
+        assert (delta > 2).mean() < 0.005
+
+    def test_rows_are_tiled_so_a_tall_band_keeps_lanczos(self, monkeypatch):
+        """A narrow canvas gives bands tens of thousands of rows tall.
+
+        Without row tiling the source window is that tall too, which trips the
+        size guard and silently drops to cubic even though Lanczos would have
+        coped.
+        """
+        calls = []
+        real = cv2.warpAffine
+        monkeypatch.setattr(cv2, "warpAffine",
+                            lambda *a, **k: (calls.append(k.get("flags")), real(*a, **k))[1])
+        piece = self._piece(rotation=45.0, scale=1.0, w=4000, h=4000)
+        M = piece.get_affine_matrix()
+        exp._warp_region(piece, M, -2000.0, -16000.0, 0, 0, 1200, 30000,
+                         cv2.INTER_LANCZOS4)
+        assert calls, "nothing was warped"
+        assert all(f == cv2.INTER_LANCZOS4 for f in calls)
+
     def test_the_source_slice_is_bounded_by_the_destination(self):
         """The whole page must not be handed over for one band of rows."""
         piece = self._piece(rotation=10.0)

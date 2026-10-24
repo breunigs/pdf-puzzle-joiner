@@ -204,11 +204,17 @@ def _warp_region(piece, M, origin_x, origin_y, x0, y0, w, h,
     """Warp a piece into a (h, w) BGRA buffer whose top-left is canvas (x0, y0).
 
     Only the slice of the source that can actually reach the destination is
-    handed to OpenCV, and the destination is filled a column at a time. Both
-    matter once a plan runs to a few kilometres at 300 dpi: the whole page was
-    otherwise passed for every band of every row it touches, and OpenCV's
-    Lanczos path flatly refuses a source at or past SHRT_MAX on either axis —
-    which a page of this kind reaches on its own.
+    handed to OpenCV, and the destination is filled in tiles. Both matter once
+    a plan runs to a few kilometres at 300 dpi: the whole page was otherwise
+    passed for every band of every row it touches, and OpenCV's Lanczos path
+    flatly refuses a source at or past SHRT_MAX on either axis — which a page
+    of this kind reaches on its own.
+
+    Re-origining the source moves the sample position within the fixed-point
+    coordinate grid by up to 1/32 px, so the result is not bit-identical to one
+    enormous call. Bilinear absorbs that to within a level; Lanczos has a
+    sharper kernel and reaches a dozen on the odd pixel of hard linework.
+    Neither is visible, but the difference is real and the tests bound it.
     """
     src = piece.get_cropped_view()
     M_local = M.copy()
@@ -216,32 +222,40 @@ def _warp_region(piece, M, origin_x, origin_y, x0, y0, w, h,
     M_local[1, 2] -= origin_y + y0
     out = np.zeros((h, w, 4), dtype=np.uint8)
     # A piece drawn smaller than life needs correspondingly more source per
-    # column, so the column shrinks to keep that slice inside the limit.
+    # tile, so the tile shrinks to keep that slice inside the limit. Rows are
+    # chunked as well as columns: a band is as tall as the memory budget
+    # allows, which for a narrow canvas is tens of thousands of rows, and a
+    # source window that tall would be pushed past the limit by its height
+    # alone and quietly lose Lanczos for no reason.
     scale = math.sqrt(abs(M[0, 0] * M[1, 1] - M[0, 1] * M[1, 0]))
     chunk = max(1024, min(_WARP_DST_CHUNK,
                           int(_WARP_DST_CHUNK * min(1.0, scale))))
-    for cx in range(0, w, chunk):
-        cw = min(chunk, w - cx)
-        M_chunk = M_local.copy()
-        M_chunk[0, 2] -= cx
-        sx0, sy0, sx1, sy1 = _source_window(src.shape, M_chunk, cw, h)
-        if sx1 <= sx0 or sy1 <= sy0:
-            continue
-        # Re-aim the affine at the cropped source's own origin.
-        M_chunk[0, 2] += M_chunk[0, 0] * sx0 + M_chunk[0, 1] * sy0
-        M_chunk[1, 2] += M_chunk[1, 0] * sx0 + M_chunk[1, 1] * sy0
-        flags = interpolation
-        if (interpolation == cv2.INTER_LANCZOS4
-                and max(sx1 - sx0, sy1 - sy0) >= _WARP_SRC_LIMIT):
-            # Nothing reasonable reaches here, but a silently wrong picture is
-            # worse than a slightly softer one: cubic takes any size.
-            flags = cv2.INTER_CUBIC
-        out[:, cx:cx + cw] = cv2.warpAffine(
-            src[sy0:sy1, sx0:sx1], M_chunk, (cw, h),
-            flags=flags,
-            borderMode=cv2.BORDER_CONSTANT,
-            borderValue=(0, 0, 0, 0),
-        )
+    for cy in range(0, h, chunk):
+        chunk_h = min(chunk, h - cy)
+        for cx in range(0, w, chunk):
+            chunk_w = min(chunk, w - cx)
+            M_chunk = M_local.copy()
+            M_chunk[0, 2] -= cx
+            M_chunk[1, 2] -= cy
+            sx0, sy0, sx1, sy1 = _source_window(src.shape, M_chunk,
+                                                chunk_w, chunk_h)
+            if sx1 <= sx0 or sy1 <= sy0:
+                continue
+            # Re-aim the affine at the cropped source's own origin.
+            M_chunk[0, 2] += M_chunk[0, 0] * sx0 + M_chunk[0, 1] * sy0
+            M_chunk[1, 2] += M_chunk[1, 0] * sx0 + M_chunk[1, 1] * sy0
+            flags = interpolation
+            if (interpolation == cv2.INTER_LANCZOS4
+                    and max(sx1 - sx0, sy1 - sy0) >= _WARP_SRC_LIMIT):
+                # Only a piece drawn far smaller than life can still get here.
+                # A slightly softer picture beats OpenCV refusing the job.
+                flags = cv2.INTER_CUBIC
+            out[cy:cy + chunk_h, cx:cx + chunk_w] = cv2.warpAffine(
+                src[sy0:sy1, sx0:sx1], M_chunk, (chunk_w, chunk_h),
+                flags=flags,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=(0, 0, 0, 0),
+            )
     return out
 
 
