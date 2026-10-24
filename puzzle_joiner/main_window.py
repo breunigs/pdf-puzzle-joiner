@@ -23,10 +23,11 @@ from .preprocessing import (
 )
 from .cache import (
     _cache_dir_for_pdf, _cached_page_path, _cached_autocrop_path,
-    _load_cached_page, save_layout, load_layout, _images_cache_dir,
+    _load_cached_page, save_layout, load_layout, load_legends, _images_cache_dir,
 )
 from .matching import auto_detect_placements, snap_piece_to_neighbors
 from .export import export_layered_tiff, export_flattened_tiff
+from .legend import make_legend_piece, clone_legend_piece
 from .worker import Worker
 from .priority import _set_low_priority
 from .widgets import (
@@ -35,7 +36,7 @@ from .widgets import (
 )
 from .undo import (
     TransformCommand, SnapCommand, SnapAllCommand, DeleteCommand, LockCommand,
-    CropCommand,
+    CropCommand, AddPieceCommand,
 )
 
 
@@ -115,6 +116,13 @@ class MainWindow(QMainWindow):
         self.action_cut.triggered.connect(self.on_cut)
         toolbar.addAction(self.action_cut)
 
+        self.action_add_legend = QAction(f"Add Leg{U}end", self)
+        self.action_add_legend.setShortcut(QKeySequence("Ctrl+G"))
+        self.action_add_legend.setToolTip(
+            "Cut a legend out of the selected page (Ctrl+G)")
+        self.action_add_legend.triggered.connect(self.on_add_legend)
+        toolbar.addAction(self.action_add_legend)
+
         self.action_lock = QAction(f"L{U}ock/Unlock", self)
         self.action_lock.setShortcut(QKeySequence("Ctrl+L"))
         self.action_lock.setToolTip("Lock/Unlock (Ctrl+L)")
@@ -145,6 +153,9 @@ class MainWindow(QMainWindow):
         # Thumbnail panel
         self.thumbnail_panel = ThumbnailPanel()
         self.thumbnail_panel.piece_selected.connect(self.on_thumbnail_select)
+        self.thumbnail_panel.add_legend_requested.connect(self.add_legend_from_page)
+        self.thumbnail_panel.duplicate_requested.connect(self.duplicate_legend)
+        self.thumbnail_panel.delete_requested.connect(self.delete_piece)
         main_layout.addWidget(self.thumbnail_panel)
 
         # Canvas
@@ -212,7 +223,7 @@ class MainWindow(QMainWindow):
         for action in (
             self.action_open_pdf, self.action_open_images,
             self.action_auto_detect, self.action_snap,
-            self.action_cut, self.action_lock,
+            self.action_cut, self.action_lock, self.action_add_legend,
             self.action_export,
         ):
             action.setEnabled(enabled)
@@ -434,10 +445,17 @@ class MainWindow(QMainWindow):
         if not self.pieces:
             self.status_bar.showMessage("No pieces loaded.")
             return
+        # Legends hold no map content to match on, and the user positioned them
+        # by hand, so they are left exactly where they are.
+        map_pieces = self._map_pieces()
+        if not map_pieces:
+            self.status_bar.showMessage("No map pages to align — only legends.")
+            return
+        n_legends = len(self.pieces) - len(map_pieces)
 
         def task(progress):
             progress.emit(10, "Computing ORB features...")
-            auto_detect_placements(self.pieces)
+            auto_detect_placements(map_pieces)
             progress.emit(90, "Syncing positions...")
             return True
 
@@ -447,16 +465,27 @@ class MainWindow(QMainWindow):
             self.view.fit_all()
             self._update_snap_enabled()
             self._auto_save_layout()
-            self.status_bar.showMessage("Auto-alignment complete.")
+            msg = "Auto-alignment complete."
+            if n_legends:
+                msg += (f" {n_legends} legend{'s' if n_legends > 1 else ''} kept "
+                        "in place — reposition if the map moved.")
+            self.status_bar.showMessage(msg)
 
         self._run_with_progress("Aligning all pieces", task, on_done=on_done)
 
     # --- Snap ---
 
+    def _map_pieces(self) -> list:
+        """Pieces that take part in matching — everything but the legends."""
+        return [p for p in self.pieces if not p.is_legend]
+
     def on_snap(self):
         piece = self.scene.get_selected_piece()
         if piece is None:
             self._snap_all()
+            return
+        if piece.is_legend:
+            self.status_bar.showMessage("Legends are placed by hand, not snapped.")
             return
         neighbors = self.scene.get_neighbors(piece)
         if not neighbors:
@@ -595,9 +624,10 @@ class MainWindow(QMainWindow):
                   for p in self.pieces}
 
         def task(progress):
-            total = len(self.pieces)
+            map_pieces = self._map_pieces()
+            total = len(map_pieces)
             results = []  # list of (piece, matched_neighbors)
-            for i, piece in enumerate(self.pieces):
+            for i, piece in enumerate(map_pieces):
                 progress.emit(int(90 * i / max(total, 1)), f"Snapping piece {i+1}/{total}...")
                 neighbors = self.scene.get_neighbors(piece)
                 if neighbors:
@@ -689,6 +719,65 @@ class MainWindow(QMainWindow):
         piece.rebuild_thumbnail()
         self.thumbnail_panel.update_piece(piece)
         self._auto_save_layout()
+
+    # --- Legends ---
+
+    def on_add_legend(self):
+        piece = self.scene.get_selected_piece()
+        if piece is None:
+            self.status_bar.showMessage("Select the page to take a legend from.")
+            return
+        if piece.is_legend:
+            self.status_bar.showMessage(
+                "Legends are cut from pages — select a page instead.")
+            return
+        self.add_legend_from_page(piece)
+
+    def add_legend_from_page(self, page: PuzzlePiece):
+        """Cut a legend out of `page` using the region the user draws."""
+        dlg = CutToolDialog(page, self, mode="legend")
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        if dlg.result_crop_rect is None:
+            return
+        legend = make_legend_piece(
+            page, dlg.result_crop_rect, dlg.result_lasso_poly,
+            instance=self._next_legend_instance(),
+            display_name=self._legend_display_name(page),
+        )
+        self._install_legend(legend, "Legend added.")
+
+    def duplicate_legend(self, legend: PuzzlePiece):
+        if not legend.is_legend:
+            return
+        instance = self._next_legend_instance()
+        name = re.sub(r" #\d+$", "", legend.display_name)
+        clone = clone_legend_piece(legend, instance, f"{name} #{instance}")
+        self._install_legend(clone, "Legend duplicated.")
+
+    def delete_piece(self, piece: PuzzlePiece):
+        """Delete a piece chosen from the thumbnail panel rather than the canvas."""
+        self.on_thumbnail_select(piece)
+        self._delete_selected_piece()
+
+    def _next_legend_instance(self) -> int:
+        """Instance numbers are never reused, so layout keys stay unambiguous."""
+        used = [p.legend_instance for p in self.pieces if p.is_legend]
+        return max(used, default=0) + 1
+
+    def _legend_display_name(self, page: PuzzlePiece) -> str:
+        base = page.display_name or os.path.basename(page.source_path)
+        return f"Legend {base}"
+
+    def _install_legend(self, legend: PuzzlePiece, message: str):
+        legend.rebuild_display_pixmap()
+        legend.rebuild_thumbnail()
+        self.undo_stack.push(AddPieceCommand(
+            legend, self.pieces, self.scene, self.thumbnail_panel,
+            post_fn=self._auto_save_layout,
+        ))
+        self.on_thumbnail_select(legend)
+        self.status_bar.showMessage(message)
 
     # --- Lock/Unlock ---
 
@@ -824,6 +913,7 @@ class MainWindow(QMainWindow):
 
     def _restore_layout(self) -> bool:
         """Restore piece positions and snap pairs from cache. Returns True if applied."""
+        self._restore_legends()
         applied, raw_pairs = load_layout(self._layout_dir, self.pieces)
         if applied:
             for piece in self.pieces:
@@ -832,10 +922,36 @@ class MainWindow(QMainWindow):
             self._recenter_pieces()
             self.thumbnail_panel.update_all()
             # Restore snap pairs
-            by_source = {os.path.basename(p.source_path): p for p in self.pieces}
+            by_source = {p.layout_key(): p for p in self.pieces}
             for a_name, b_name in raw_pairs:
                 a = by_source.get(a_name)
                 b = by_source.get(b_name)
                 if a and b:
                     self.scene.add_snap_pair(a, b)
         return applied
+
+    def _restore_legends(self):
+        """Re-cut the saved legends, so the layout pass has something to place.
+
+        A legend whose page is not loaded is skipped rather than guessed at —
+        that happens when the layout was saved alongside a second input file.
+        """
+        by_key = {p.layout_key(): p for p in self.pieces}
+        for definition in load_legends(self._layout_dir):
+            source = by_key.get(definition.get("source_key"))
+            if source is None:
+                continue
+            instance = definition.get("instance", self._next_legend_instance())
+            if any(p.is_legend and p.legend_instance == instance
+                   and p.legend_source_key == definition.get("source_key")
+                   for p in self.pieces):
+                continue  # already restored
+            legend = make_legend_piece(
+                source, definition["rect"], None, instance=instance,
+                display_name=definition.get("display_name", ""),
+            )
+            legend.rebuild_display_pixmap()
+            legend.rebuild_thumbnail()
+            self.pieces.append(legend)
+            self.scene.add_piece(legend)
+            self.thumbnail_panel.add_piece(legend)

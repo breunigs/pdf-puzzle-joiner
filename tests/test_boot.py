@@ -5,6 +5,7 @@ os.environ["QT_QPA_PLATFORM"] = "offscreen"
 
 import sys
 import numpy as np
+from PySide6.QtCore import QThreadPool
 from PySide6.QtWidgets import QApplication
 from puzzle_joiner.main_window import MainWindow
 from puzzle_joiner.model import PuzzlePiece
@@ -58,6 +59,135 @@ def test_recenter_syncs_scene_when_already_centered():
     item1 = window.scene.piece_items[window.pieces[1]]
     assert item0.rotation() == 45.0
     assert item1.rotation() == -45.0
+    window.close()
+
+
+def _window_with_page(tmp_path):
+    """A window holding one page, with layout autosave pointed at tmp_path."""
+    QApplication.instance() or QApplication(sys.argv)
+    window = MainWindow()
+    page = PuzzlePiece()
+    page.source_path = "/tmp/page_0001.png"
+    page.display_name = "Page 1"
+    rng = np.random.default_rng(3)
+    page.image = rng.integers(0, 256, (300, 400, 4), dtype=np.uint8)
+    page.image[:, :, 3] = 255
+    page.crop_rect = (0, 0, 200, 300)
+    page.x, page.y = 100, 150
+    page.rebuild_display_pixmap()
+    page.rebuild_thumbnail()
+    window.pieces.append(page)
+    window.scene.add_piece(page)
+    window.thumbnail_panel.add_piece(page)
+    window._layout_dir = str(tmp_path)
+    return window, page
+
+
+def _stub_legend_dialog(monkeypatch, rect, lasso=None):
+    """Make the cut dialog accept immediately with a fixed region."""
+    from PySide6.QtWidgets import QDialog
+
+    class FakeDialog:
+        def __init__(self, piece, parent=None, mode="crop"):
+            assert mode == "legend"
+            self.result_crop_rect = rect
+            self.result_lasso_poly = lasso
+
+        def exec(self):
+            return QDialog.DialogCode.Accepted
+
+    monkeypatch.setattr("puzzle_joiner.main_window.CutToolDialog", FakeDialog)
+
+
+def test_adding_a_legend_is_undoable(tmp_path, monkeypatch):
+    window, page = _window_with_page(tmp_path)
+    _stub_legend_dialog(monkeypatch, (300, 20, 80, 60))
+
+    window.add_legend_from_page(page)
+    assert len(window.pieces) == 2
+    legend = window.pieces[1]
+    assert legend.is_legend
+    assert legend.layout_key() == "page_0001.png#legend1"
+    assert legend in window.scene.piece_items
+    assert legend in window.thumbnail_panel.thumb_widgets
+
+    window.undo_stack.undo()
+    assert window.pieces == [page]
+    assert legend not in window.scene.piece_items
+    assert legend not in window.thumbnail_panel.thumb_widgets
+
+    window.undo_stack.redo()
+    assert window.pieces[1] is legend
+    window.close()
+
+
+def test_duplicating_a_legend_gets_a_fresh_instance(tmp_path, monkeypatch):
+    window, page = _window_with_page(tmp_path)
+    _stub_legend_dialog(monkeypatch, (300, 20, 80, 60))
+    window.add_legend_from_page(page)
+    window.duplicate_legend(window.pieces[1])
+
+    first, second = window.pieces[1], window.pieces[2]
+    assert second.is_legend
+    assert first.layout_key() != second.layout_key()
+    assert second.legend_rect == first.legend_rect
+    window.close()
+
+
+def test_legends_survive_a_layout_round_trip(tmp_path, monkeypatch):
+    window, page = _window_with_page(tmp_path)
+    _stub_legend_dialog(monkeypatch, (300, 20, 80, 60))
+    window.add_legend_from_page(page)
+    legend = window.pieces[1]
+    legend.x, legend.y = 777.0, -888.0
+    legend.rotation_deg = 31.0
+    window._auto_save_layout()
+    window.close()
+
+    # A fresh session loading the same page must rebuild the legend.
+    reopened, _ = _window_with_page(tmp_path)
+    assert reopened._restore_layout()
+    assert len(reopened.pieces) == 2
+    restored = reopened.pieces[1]
+    assert restored.is_legend
+    assert restored.legend_rect == (300, 20, 80, 60)
+    # Positions come back relative to the centroid recentring.
+    assert restored.rotation_deg == 31.0
+    assert restored.image.shape == (60, 80, 4)
+    reopened.close()
+
+
+def test_restoring_twice_does_not_duplicate_legends(tmp_path, monkeypatch):
+    window, page = _window_with_page(tmp_path)
+    _stub_legend_dialog(monkeypatch, (300, 20, 80, 60))
+    window.add_legend_from_page(page)
+    window._auto_save_layout()
+    window._restore_layout()
+    window._restore_layout()
+    assert sum(1 for p in window.pieces if p.is_legend) == 1
+    window.close()
+
+
+def test_auto_align_leaves_legends_alone(tmp_path, monkeypatch):
+    window, page = _window_with_page(tmp_path)
+    _stub_legend_dialog(monkeypatch, (300, 20, 80, 60))
+    window.add_legend_from_page(page)
+    legend = window.pieces[1]
+    legend.x, legend.y = 900.0, 50.0
+
+    seen = {}
+
+    def fake_detect(pieces):
+        seen["pieces"] = list(pieces)
+
+    monkeypatch.setattr("puzzle_joiner.main_window.auto_detect_placements",
+                        fake_detect)
+    window.on_auto_detect()
+    # The alignment runs on the thread pool; wait for it before reading back.
+    assert QThreadPool.globalInstance().waitForDone(10000)
+    QApplication.processEvents()
+    assert seen.get("pieces") == [page], "legends must be kept out of matching"
+    assert (legend.x, legend.y) == (900.0, 50.0)
     window.close()
 
 

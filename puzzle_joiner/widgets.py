@@ -26,6 +26,7 @@ from PySide6.QtGui import (
 )
 
 from .model import PuzzlePiece
+from .legend import anchor_pair
 from .priority import LOW_PRIO
 from .preprocessing import parse_page_range
 
@@ -316,7 +317,12 @@ class PuzzlePieceItem(QGraphicsPixmapItem):
         self.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
         self.setTransformOriginPoint(self.boundingRect().center())
         self.transform_handles = TransformHandles(self)
+        self.setZValue(self._base_z())
         self.sync_from_piece()
+
+    def _base_z(self) -> float:
+        """Legends sit above the map, which is where they are read."""
+        return 1.0 if self.piece.is_legend else 0.0
 
     def sync_from_piece(self):
         self._syncing = True
@@ -347,7 +353,7 @@ class PuzzlePieceItem(QGraphicsPixmapItem):
     def itemChange(self, change, value):
         if change == QGraphicsItem.GraphicsItemChange.ItemSelectedHasChanged:
             is_sel = bool(value)
-            self.setZValue(5 if is_sel else 0)
+            self.setZValue(5 if is_sel else self._base_z())
             self.transform_handles.set_visible(is_sel)
             if self.scene_ref and hasattr(self.scene_ref, 'piece_selection_changed'):
                 self.scene_ref.piece_selection_changed(self.piece, is_sel)
@@ -406,7 +412,9 @@ class PuzzleScene(QGraphicsScene):
         self.snap_transforms: dict = {}  # frozenset({a,b}) -> (tx,ty,rot,scale)
         self.undo_stack = undo_stack
         self.editing_enabled = True
+        self._anchor_item = None  # export-pivot indicator for a selected legend
         self.setSceneRect(-50000, -50000, 100000, 100000)
+        self.piece_moved_signal.connect(self.update_legend_anchor)
 
     def add_piece(self, piece: PuzzlePiece) -> PuzzlePieceItem:
         item = PuzzlePieceItem(piece, self)
@@ -443,11 +451,18 @@ class PuzzleScene(QGraphicsScene):
         return None
 
     def get_neighbors(self, piece: PuzzlePiece, margin=500) -> list:
+        """Pieces close enough to `piece` to be worth matching against.
+
+        Legends never qualify: they carry no map content to align to, and a
+        legend must keep the position the user chose for it.
+        """
+        if piece.is_legend:
+            return []
         bb = piece.get_bounding_box()
         expanded = bb.adjusted(-margin, -margin, margin, margin)
         neighbors = []
         for p, item in self.piece_items.items():
-            if p is piece:
+            if p is piece or p.is_legend:
                 continue
             if p.get_bounding_box().intersects(expanded):
                 neighbors.append(p)
@@ -521,10 +536,13 @@ class PuzzleScene(QGraphicsScene):
 
     def get_drag_group(self, piece: PuzzlePiece) -> list:
         """Return all pieces that should move together when dragging piece.
-        Unlocked pieces move individually. Locked pieces move all locked pieces."""
-        if not piece.is_locked:
+
+        Unlocked pieces move individually. Locked pieces move all locked pieces.
+        Legends always move alone — they are positioned against the map by hand.
+        """
+        if not piece.is_locked or piece.is_legend:
             return [piece]
-        return [p for p in self.piece_items if p.is_locked]
+        return [p for p in self.piece_items if p.is_locked and not p.is_legend]
 
     def piece_selection_changed(self, piece: PuzzlePiece, selected: bool):
         if selected:
@@ -532,11 +550,48 @@ class PuzzleScene(QGraphicsScene):
         else:
             if not self.selectedItems():
                 self.selection_changed_signal.emit(None)
+        self.update_legend_anchor()
+
+    def update_legend_anchor(self):
+        """Mark the point a selected legend will be pivoted on at export time.
+
+        The export rotates a legend upright about the point of it nearest the
+        map, so that is the one spot guaranteed not to move. Showing it makes the
+        swing the rest of the legend takes predictable.
+        """
+        if self._anchor_item is not None:
+            self.removeItem(self._anchor_item)
+            self._anchor_item = None
+        piece = self.get_selected_piece()
+        if piece is None or not piece.is_legend:
+            return
+        pair = anchor_pair(piece, list(self.piece_items))
+        if pair is None:
+            return
+        anchor, target = pair
+        ax, ay = float(anchor[0]), float(anchor[1])
+        bb = piece.get_bounding_box()
+        r = max(4.0, 0.03 * max(bb.width(), bb.height()))
+        path = QPainterPath()
+        path.moveTo(ax, ay)
+        path.lineTo(float(target[0]), float(target[1]))
+        path.addEllipse(QRectF(ax - r, ay - r, 2 * r, 2 * r))
+        item = QGraphicsPathItem(path)
+        pen = QPen(QColor(60, 190, 110), 2)
+        pen.setStyle(Qt.PenStyle.DashLine)
+        pen.setCosmetic(True)
+        item.setPen(pen)
+        item.setBrush(QBrush(Qt.BrushStyle.NoBrush))
+        item.setZValue(6)
+        item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+        self.addItem(item)
+        self._anchor_item = item
 
     def sync_all_from_pieces(self):
         for piece, item in self.piece_items.items():
             item.sync_from_piece()
         self.update_scene_rect()
+        self.update_legend_anchor()
 
 
 class PuzzleView(QGraphicsView):
@@ -865,7 +920,11 @@ class ThumbnailWidget(QWidget):
                 Qt.AspectRatioMode.KeepAspectRatio,
                 Qt.TransformationMode.SmoothTransformation,
             )
-            if piece.is_locked:
+            if piece.is_legend:
+                # Legends are never matched, so the unmatched tint below would
+                # mark every one of them as a problem.
+                self.thumb_label.setPixmap(scaled)
+            elif piece.is_locked:
                 # Draw lock overlay
                 pm = QPixmap(scaled.size())
                 pm.fill(Qt.GlobalColor.transparent)
@@ -890,27 +949,30 @@ class ThumbnailWidget(QWidget):
 
         name = piece.display_name or os.path.basename(piece.source_path)
         extra = ""
-        if piece.is_locked:
-            extra = " [L]"
-        elif not piece.is_matched:
-            extra = " (!)"
+        if not piece.is_legend:
+            if piece.is_locked:
+                extra = " [L]"
+            elif not piece.is_matched:
+                extra = " (!)"
         self.name_label.setText(name + extra)
 
         # Update border, preserving selection highlight
         if not self._selected:
-            if piece.is_locked:
-                self.setStyleSheet("QWidget { border: 2px solid orange; }")
-            else:
-                self.setStyleSheet("QWidget { border: 2px solid transparent; }")
+            self.setStyleSheet(f"QWidget {{ border: 2px solid {self._border_colour()}; }}")
+
+    def _border_colour(self) -> str:
+        if self.piece.is_legend:
+            return "#44aa66"
+        if self.piece.is_locked:
+            return "orange"
+        return "transparent"
 
     def set_selected(self, selected: bool):
         self._selected = selected
         if selected:
             self.setStyleSheet("QWidget { border: 2px solid #4488ff; background: #ddeeff; }")
-        elif self.piece.is_locked:
-            self.setStyleSheet("QWidget { border: 2px solid orange; }")
         else:
-            self.setStyleSheet("QWidget { border: 2px solid transparent; }")
+            self.setStyleSheet(f"QWidget {{ border: 2px solid {self._border_colour()}; }}")
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -922,7 +984,10 @@ class ThumbnailWidget(QWidget):
 
 
 class ThumbnailPanel(QWidget):
-    piece_selected = Signal(object)  # PuzzlePiece
+    piece_selected = Signal(object)        # PuzzlePiece
+    add_legend_requested = Signal(object)  # source page PuzzlePiece
+    duplicate_requested = Signal(object)   # legend PuzzlePiece
+    delete_requested = Signal(object)      # PuzzlePiece
 
     def __init__(self):
         super().__init__()
@@ -983,15 +1048,30 @@ class ThumbnailPanel(QWidget):
 
     def _on_thumb_right_clicked(self, piece: PuzzlePiece, global_pos):
         menu = QMenu(self)
-        if piece.is_locked:
-            action = menu.addAction("Unlock")
+        lock_action = None
+        if piece.is_legend:
+            dup_action = menu.addAction("Duplicate Legend")
+            del_action = menu.addAction("Delete Legend")
+            add_action = None
         else:
-            action = menu.addAction("Lock")
+            lock_action = menu.addAction("Unlock" if piece.is_locked else "Lock")
+            menu.addSeparator()
+            add_action = menu.addAction("Add Legend From This Page...")
+            dup_action = del_action = None
+
         chosen = menu.exec(global_pos)
-        if chosen:
+        if chosen is None:
+            return
+        if chosen is lock_action:
             piece.is_locked = not piece.is_locked
             self.update_piece(piece)
             self.piece_selected.emit(piece)  # trigger scene update
+        elif chosen is add_action:
+            self.add_legend_requested.emit(piece)
+        elif chosen is dup_action:
+            self.duplicate_requested.emit(piece)
+        elif chosen is del_action:
+            self.delete_requested.emit(piece)
 
 
 class ThumbnailWorkerSignals(QObject):
@@ -1862,10 +1942,18 @@ class CropView(QGraphicsView):
 
 
 class CutToolDialog(QDialog):
-    def __init__(self, piece: PuzzlePiece, parent=None):
+    """Pick a region of a page, either as its crop or as a legend to lift off it.
+
+    In "legend" mode nothing is preselected — the page's own crop is outlined as a
+    reference instead, because a legend is cut from outside it.
+    """
+
+    def __init__(self, piece: PuzzlePiece, parent=None, mode: str = "crop"):
         super().__init__(parent)
         self.piece = piece
-        self.setWindowTitle(f"Cut - {os.path.basename(piece.source_path)}")
+        self.mode = mode
+        verb = "Select Legend Region" if mode == "legend" else "Cut"
+        self.setWindowTitle(f"{verb} - {os.path.basename(piece.source_path)}")
         self.setMinimumSize(800, 600)
 
         layout = QVBoxLayout(self)
@@ -1891,11 +1979,13 @@ class CutToolDialog(QDialog):
         self.view.set_image_rect(image_rect)
 
         # Results the caller reads after Accepted; the dialog never touches the piece.
-        self.result_crop_rect = piece.crop_rect
-        self.result_lasso_poly = piece.lasso_poly
+        self.result_crop_rect = None if mode == "legend" else piece.crop_rect
+        self.result_lasso_poly = None if mode == "legend" else piece.lasso_poly
 
+        if mode == "legend":
+            self._outline_map_area()
         # Restore whichever region the piece already carries
-        if piece.lasso_poly:
+        elif piece.lasso_poly:
             self.view.tool = "lasso"
             self.view.lasso_item = LassoItem(
                 image_rect, self.scene, points=piece.lasso_poly, closed=True)
@@ -1934,6 +2024,9 @@ class CutToolDialog(QDialog):
         self.apply_btn.clicked.connect(self._apply)
         self.reset_btn.clicked.connect(self._reset)
         self.cancel_btn.clicked.connect(self.reject)
+        if mode == "legend":
+            # There is no crop to reset — an unwanted legend is just cancelled.
+            self.reset_btn.hide()
         for btn in (self.apply_btn, self.reset_btn, self.cancel_btn):
             # Enter closes the lasso instead of activating a button.
             btn.setAutoDefault(False)
@@ -1953,9 +2046,27 @@ class CutToolDialog(QDialog):
                    "point to correct it, drag a small midpoint to add one, "
                    "right-click a point to delete it.")
 
+    _LEGEND_HINT = "Select the legend outside the dashed map outline. "
+
+    def _outline_map_area(self):
+        """Mark the page's own crop, so it is clear which part is already in use."""
+        if not self.piece.crop_rect:
+            return
+        cx, cy, cw, ch = self.piece.crop_rect
+        ref = QGraphicsRectItem(QRectF(cx, cy, cw, ch))
+        pen = QPen(QColor(80, 200, 120), 2)
+        pen.setStyle(Qt.PenStyle.DashLine)
+        pen.setCosmetic(True)
+        ref.setPen(pen)
+        ref.setBrush(QBrush(Qt.BrushStyle.NoBrush))
+        ref.setZValue(4)
+        ref.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+        self.scene.addItem(ref)
+
     def _update_hint(self):
         base = self._LASSO_HINT if self.view.tool == "lasso" else self._RECT_HINT
-        self.label.setText(base + " Middle-click to pan. Scroll to zoom.")
+        prefix = self._LEGEND_HINT if self.mode == "legend" else ""
+        self.label.setText(prefix + base + " Middle-click to pan. Scroll to zoom.")
 
     def _set_tool(self, name: str):
         self.view.set_tool(name)
@@ -1981,9 +2092,23 @@ class CutToolDialog(QDialog):
         else:
             self._apply_rect()
 
+    def _warn_missing_region(self) -> bool:
+        """True (after warning) when legend mode was applied with nothing selected.
+
+        Crop mode reads an empty selection as "clear the crop", which is a valid
+        thing to apply; there is no such reading for a legend.
+        """
+        if self.mode != "legend":
+            return False
+        QMessageBox.warning(self, "No region",
+                            "Select the legend region first, or cancel.")
+        return True
+
     def _apply_rect(self):
         cri = self.view.crop_rect_item
         if cri is None:
+            if self._warn_missing_region():
+                return
             self.result_crop_rect = None
             self.result_lasso_poly = None
             self.accept()
@@ -1999,6 +2124,8 @@ class CutToolDialog(QDialog):
     def _apply_lasso(self):
         li = self.view.lasso_item
         if li is None or not li.points:
+            if self._warn_missing_region():
+                return
             self.result_crop_rect = None
             self.result_lasso_poly = None
             self.accept()

@@ -1,4 +1,5 @@
 import math
+import os
 from typing import Optional
 
 import cv2
@@ -27,6 +28,25 @@ class PuzzlePiece:
         self.is_matched: bool = False
         self.is_locked: bool = False
         self.layer_index: int = 0
+        # Legend state. A legend is a region lifted off a page and placed beside
+        # the assembled map: it takes no part in matching, and the export undoes
+        # its rotation so it comes out upright. `legend_rect` records where it was
+        # cut from so the instance can be rebuilt from a saved layout.
+        self.is_legend: bool = False
+        self.legend_source_key: str = ""
+        self.legend_rect: Optional[tuple] = None
+        self.legend_instance: int = 0
+
+    def layout_key(self) -> str:
+        """Stable identity for layout persistence.
+
+        Legend instances share their page's source path, so they need the
+        instance number to be told apart from the page and from each other.
+        """
+        base = os.path.basename(self.source_path)
+        if self.is_legend:
+            return f"{base}#legend{self.legend_instance}"
+        return base
 
     def apply_crop(self, crop_rect: Optional[tuple], lasso_poly: Optional[list] = None):
         """Set the crop rect and optional lasso polygon, refreshing the alpha mask.

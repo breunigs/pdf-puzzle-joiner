@@ -64,8 +64,8 @@ def save_layout(cache_dir: str, pieces, snap_pairs=None) -> None:
         return
     entries = []
     for piece in pieces:
-        entries.append({
-            "source": os.path.basename(piece.source_path),
+        entry = {
+            "source": piece.layout_key(),
             "x": piece.x,
             "y": piece.y,
             "rotation_deg": piece.rotation_deg,
@@ -75,42 +75,71 @@ def save_layout(cache_dir: str, pieces, snap_pairs=None) -> None:
             "crop_rect": list(piece.crop_rect) if piece.crop_rect is not None else None,
             "lasso_poly": ([list(p) for p in piece.lasso_poly]
                            if piece.lasso_poly is not None else None),
-        })
+        }
+        if piece.is_legend:
+            # Enough to cut the instance out of its page again on the next load.
+            entry["legend"] = {
+                "source_key": piece.legend_source_key,
+                "rect": list(piece.legend_rect) if piece.legend_rect else None,
+                "instance": piece.legend_instance,
+                "display_name": piece.display_name,
+            }
+        entries.append(entry)
     data = {"pieces": entries}
     if snap_pairs:
         data["snap_pairs"] = [
-            [os.path.basename(a.source_path), os.path.basename(b.source_path)]
-            for a, b in snap_pairs
+            [a.layout_key(), b.layout_key()] for a, b in snap_pairs
         ]
     path = _layout_path(cache_dir)
     with open(path, "w") as f:
         json.dump(data, f, indent=1)
 
 
+def _read_layout(cache_dir: str):
+    """Read a layout file as (entries, snap_pairs); ([], []) when there is none.
+
+    Handles both the old format (a flat list) and the current one (a dict with
+    pieces and snap_pairs).
+    """
+    if not cache_dir:
+        return [], []
+    path = _layout_path(cache_dir)
+    if not os.path.exists(path):
+        return [], []
+    with open(path, "r") as f:
+        raw = json.load(f)
+    if isinstance(raw, list):
+        return raw, []
+    return raw.get("pieces", []), raw.get("snap_pairs", [])
+
+
+def load_legends(cache_dir: str) -> list:
+    """Legend definitions from a saved layout, in save order.
+
+    Returned separately from `load_layout` because the pieces must be cut out of
+    their pages before there is anything for the layout pass to position.
+    """
+    entries, _ = _read_layout(cache_dir)
+    legends = []
+    for e in entries:
+        legend = e.get("legend")
+        if legend and legend.get("rect"):
+            legends.append(legend)
+    return legends
+
+
 def load_layout(cache_dir: str, pieces):
     """Restore piece layout state from cache dir.
 
-    Returns (applied: bool, snap_pairs: list of [basename_a, basename_b]).
+    Returns (applied: bool, snap_pairs: list of [key_a, key_b]).
     """
-    if not cache_dir:
+    entries, raw_snap_pairs = _read_layout(cache_dir)
+    if not entries:
         return False, []
-    path = _layout_path(cache_dir)
-    if not os.path.exists(path):
-        return False, []
-    with open(path, "r") as f:
-        raw = json.load(f)
-    # Handle both old format (flat list) and new format (dict with pieces/snap_pairs)
-    if isinstance(raw, list):
-        entries = raw
-        raw_snap_pairs = []
-    else:
-        entries = raw.get("pieces", [])
-        raw_snap_pairs = raw.get("snap_pairs", [])
     by_source = {e["source"]: e for e in entries}
     applied = False
     for piece in pieces:
-        key = os.path.basename(piece.source_path)
-        e = by_source.get(key)
+        e = by_source.get(piece.layout_key())
         if e is None:
             continue
         piece.x = e["x"]

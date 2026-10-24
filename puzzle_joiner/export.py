@@ -6,6 +6,7 @@ import numpy as np
 import tifffile
 
 from .model import PuzzlePiece
+from .legend import anchor_local, map_hull, separate_legends, upright_affine
 
 TILE = 1024
 # Byte budget for one horizontal band of the canvas. Bands are rendered and
@@ -22,7 +23,14 @@ _ENCODE_WORKERS = max(1, (os.cpu_count() or 2) * 3 // 4)
 def _layer_name(piece: PuzzlePiece) -> str:
     """Derive a human-readable layer name (7-bit ASCII for TIFF compat)."""
     name = piece.display_name or os.path.basename(piece.source_path)
+    if piece.is_legend and piece.legend_source_key:
+        name = f"{name} ({piece.legend_source_key})"
     return name.encode("ascii", errors="replace").decode("ascii")
+
+
+def export_order(pieces: list) -> list:
+    """Pieces in compositing order — legends last, so they sit on top."""
+    return sorted(pieces, key=lambda p: p.is_legend)
 
 
 def _compute_optimal_rotation(pieces):
@@ -44,26 +52,54 @@ def _compute_optimal_rotation(pieces):
     return angle, rect[0][0], rect[0][1]
 
 
-def _export_affines(pieces):
-    """Piece affine matrices with optimal rotation applied for minimal export size."""
-    base = [p.get_affine_matrix() for p in pieces]
-    if len(pieces) < 2:
-        return base
-    angle, cx, cy = _compute_optimal_rotation(pieces)
-    if abs(angle) < 0.1:
-        return base
+def _rotation_about(angle, cx, cy):
+    """3x3 rotation of `angle` degrees about the point (cx, cy)."""
     rad = math.radians(angle)
     cos_a = math.cos(rad)
     sin_a = math.sin(rad)
-    R = np.array([
+    return np.array([
         [cos_a, -sin_a, cx - cos_a * cx + sin_a * cy],
         [sin_a,  cos_a, cy - sin_a * cx - cos_a * cy],
+        [0, 0, 1],
     ], dtype=np.float64)
-    R3 = np.vstack([R, [0, 0, 1]])
+
+
+def _export_affines(pieces):
+    """Piece affine matrices as the export lays them out.
+
+    The map is rotated to the angle that minimises the canvas. Legends ride along
+    with that rotation only as far as their anchor point: each is then re-emitted
+    axis-aligned about that point, so it comes out upright without drifting away
+    from the map. Legends are left out of the angle search — they are not part of
+    the shape being minimised, and they do not keep the angle they are measured at.
+
+    Squaring a legend up changes its footprint, so a last pass nudges legends off
+    the map and off each other; see `separate_legends`.
+    """
+    base = [p.get_affine_matrix() for p in pieces]
+    map_pieces = [p for p in pieces if not p.is_legend]
+    legends = [p for p in pieces if p.is_legend]
+
+    R3 = None
+    if len(map_pieces) >= 2:
+        angle, cx, cy = _compute_optimal_rotation(map_pieces)
+        if abs(angle) >= 0.1:
+            R3 = _rotation_about(angle, cx, cy)
+    if R3 is None and not legends:
+        return base
+
+    hull = map_hull(map_pieces) if legends else None
     result = []
-    for M in base:
-        M3 = np.vstack([M, [0, 0, 1]])
-        result.append((R3 @ M3)[:2])
+    anchors = {}
+    for idx, (piece, M) in enumerate(zip(pieces, base)):
+        if R3 is not None:
+            M = (R3 @ np.vstack([M, [0, 0, 1]]))[:2]
+        if piece.is_legend:
+            anchors[idx] = anchor_local(piece, hull)
+            M = upright_affine(M, anchors[idx])
+        result.append(M)
+    if legends:
+        result = separate_legends(pieces, result, anchors)
     return result
 
 
@@ -218,6 +254,7 @@ def _layer_tiles(piece, M, origin_x, origin_y, canvas_w, canvas_h):
 def export_layered_tiff(pieces: list, output_path: str):
     if not pieces:
         return
+    pieces = export_order(pieces)
     affines = _export_affines(pieces)
     origin_x, origin_y, canvas_w, canvas_h = _union_bbox(pieces, affines)
     _check_memory(canvas_w, TILE)
@@ -273,6 +310,7 @@ def _check_memory(canvas_w: int, band_h: int):
 def export_flattened_tiff(pieces: list, output_path: str):
     if not pieces:
         return
+    pieces = export_order(pieces)
     affines = _export_affines(pieces)
     origin_x, origin_y, canvas_w, canvas_h = _union_bbox(pieces, affines)
     _check_memory(canvas_w, _band_height(canvas_w))

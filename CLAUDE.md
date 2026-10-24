@@ -23,6 +23,7 @@ puzzle_joiner/
   preprocessing.py         # PDF split, border crop, legend removal, auto-crop computation
   cache.py                 # Page cache (~/.cache/puzzle-joiner/{md5}/)
   matching.py              # ORB features, pairwise matching, auto-detect, snap
+  legend.py                # Legend instances, export anchor + uprighting math
   export.py                # Layered + flattened TIFF export
   undo.py                  # QUndoCommand subclasses (TransformCommand, SnapCommand, CropCommand, LockCommand)
   worker.py                # WorkerSignals, Worker (QRunnable pattern)
@@ -36,13 +37,16 @@ tests/
   test_priority.py         # LOW_PRIO prefix
   test_undo.py             # undo/redo commands (transform, snap, lock)
   test_lasso.py            # lasso crop: alpha masking, polygon editor, cut-tool undo
-  test_boot.py             # smoke test: MainWindow constructs (offscreen Qt)
+  test_legend.py           # legends: cutting, anchor/upright math, gating, persistence
+  test_boot.py             # smoke test: MainWindow constructs, legend add/undo/restore
 ```
 
 ## Module Responsibilities
 
 ### `model.py`
 `PuzzlePiece` — holds full-res BGRA image, display pixmap (max 2048px), thumbnail (256px), and transform state (`x, y, rotation_deg, scale, crop_rect`, `lasso_poly`). Key methods: `get_affine_matrix()`, `get_bounding_box()`, `get_cropped_image()`.
+
+`layout_key()` is the piece's identity for layout persistence. Pages key on their source basename; legend instances share their page's source path, so they append `#legend{n}` to be told apart from the page and from each other. See `legend.py` for the rest of the legend state.
 
 **Cropping.** `crop_rect` is always the rectangle that defines the piece's local coordinate system, so all geometry stays rect-based. An optional `lasso_poly` (polygon in full-image coords, with `crop_rect` holding its bounding box) additionally masks the alpha channel, which is what hides the outside in the preview and the export. `apply_crop(crop_rect, lasso_poly)` sets both and refreshes the mask; the mask is written into `image`'s alpha in place so `get_cropped_view()` stays zero-copy, with the original channel kept in `_base_alpha` so edits are repeatable. `get_match_image()` returns the rect crop with the mask lifted — matching deliberately ignores the lasso so a rough outline cannot cost a pair its overlap. `get_outline_points()` returns the opaque extent in local coords, which the export uses to size its canvas.
 
@@ -58,22 +62,35 @@ Persistent cache at `~/.cache/puzzle-joiner/{md5}/`. Stores uncropped page PNGs 
 - **Auto-detect** (`auto_detect_placements`): greedy BFS placement, >75% pixel match threshold.
 - **Snap** (`snap_piece_to_neighbors`): 50k features, no gray masking, ROI-based overlap matching, ≥50% pixel threshold.
 
+### `legend.py`
+A legend is a region lifted off a page and placed beside the assembled map — a `PuzzlePiece` with `is_legend` set, owning its own copy of the pixels (so editing the page cannot punch holes in it, and one region can be included any number of times). `make_legend_piece` cuts one from a page, taking `_base_alpha` so a lasso drawn round the map does not make the legend transparent; `clone_legend_piece` duplicates an instance.
+
+**Anchor and uprighting.** On the canvas a legend rotates freely, which is how a user lines it up against a map sitting at an arbitrary angle. The export throws that rotation away: `anchor_local` finds the point of the legend nearest the map (`map_hull`, densified outline so the winner can land mid-edge), and `upright_affine` re-emits the legend axis-aligned about that point. Pivoting on the anchor is what keeps the legend as close to the map as the user placed it, whatever rotation the export applies to the map. Distances are measured in canvas space — the global rotation is rigid, so the winning point is the same one in export space. `anchor_pair` returns the world-space anchor and its nearest map point, which the canvas draws as the export-pivot indicator.
+
+Note the legend body *does* swing when it is uprighted; only the anchor is pinned. The pivot is shown on the canvas so that swing is predictable.
+
+**Separation.** Because the swing changes a legend's footprint, a legend clear of everything on the canvas can land on the map or on a neighbour once squared up — the pivots are per legend, so nothing about the rotation keeps two of them apart. `separate_legends` resolves that afterwards: legends are processed nearest-the-map first (ties by instance number, so the result does not depend on list order), and each is translated the shortest distance that clears the map and every legend already placed. Candidate directions are straight out from the map plus both sideways; reversing back towards the map is only allowed for a legend that *starts* on top of it, where the nearest edge is the way out. The distance along a direction is exact, not iterative: `moving + t*d` meets an obstacle exactly when `t*d` is inside the Minkowski difference, which is convex, so `_ray_overlap_interval` gets the overlapping `t` range by clipping the ray against its edges, and `_clear_distance` sweeps those ranges until `t` is outside all of them. A nudge is a pure translation, so it cannot reintroduce rotation.
+
 ### `export.py`
 - **Layered TIFF**: each piece as a separate BigTIFF layer (deflate, 1024x1024 tiles).
 - **Flattened TIFF**: alpha-composite all pieces onto single canvas.
 - Canvas is sized from `get_outline_points()`, so a lasso shrinks it to the polygon hull (plus a 1 px fringe for the antialiased edge). Masked-out pixels are transparent and need no special handling.
+- `_compute_optimal_rotation` sees map pieces only: a legend is not part of the shape being minimised, and it does not keep the angle it is measured at. `_export_affines` then rides each legend along the global rotation as far as its anchor, re-emits it upright, and runs `separate_legends` to nudge any overlaps apart (all three in `legend.py`); everything downstream is affine-generic and needs no legend case. `export_order` puts legends last so they composite on top.
 
 ### `widgets.py`
 - `HandleItem`, `TransformHandles`: GIMP-style resize/rotate handles.
 - `PuzzlePieceItem`: syncs between model and scene, red border when selected.
 - `PuzzleScene`, `PuzzleView`: virtual canvas with zoom/pan.
-- `ThumbnailPanel`: horizontal strip with lock/matched indicators.
+- `ThumbnailPanel`: horizontal strip with lock/matched indicators; green border for legends, which are never "matched" and so must skip the unmatched tint. Right-click offers Lock plus Add Legend on a page, Duplicate/Delete on a legend, relayed to `MainWindow` as signals.
+- `PuzzleScene.update_legend_anchor`: dashed marker showing the point the export will pivot a selected legend on. `get_neighbors` and `get_drag_group` both exclude legends, so no snap can reach them and no lock group can drag them.
 - `PdfImportDialog`: page selection grid with async thumbnail generation.
 - `CutToolDialog`: crop region editor showing the full uncropped image, unmasked so an existing lasso can be pushed outwards. Two tools: Rectangle (`CropRectItem`) and Lasso (`LassoItem`).
 - `LassoItem`, `LassoVertexItem`: GIMP-style piecewise-linear selection — click to place points, close by clicking the first point / double-click / Enter, Backspace to undo a point, drag a vertex to correct it, drag a midpoint knob to insert one, right-click to delete. `CropView` owns all the hit-testing and dragging, by index: moving a point can rebuild the handle list, so no handle may hold the mouse grab.
 
 ### `main_window.py`
-Toolbar workflow: Open PDF/Images → Auto-Detect → Snap → Cut → Lock → Export. Manages piece list, threading, progress dialogs.
+Toolbar workflow: Open PDF/Images → Auto-Detect → Snap → Cut → Add Legend → Lock → Export. Manages piece list, threading, progress dialogs.
+
+**Legends.** `_map_pieces()` is the matching set — Auto-Detect and Snap both run on it, so legends are never matched or moved by them (Auto-Detect leaves them exactly where they are and says so in the status bar). `add_legend_from_page` opens `CutToolDialog` in `mode="legend"`, `duplicate_legend` clones one, and both go on the undo stack via `AddPieceCommand`. `_restore_legends` re-cuts saved legends before `load_layout` positions them, skipping any whose page is not loaded.
 
 ### `priority.py`
 Builds `LOW_PRIO` prefix (`chrt --idle 0 nice -n19 ionice --class idle`) for subprocesses. `_set_low_priority()` for ProcessPoolExecutor worker initializer.
@@ -84,6 +101,8 @@ Builds `LOW_PRIO` prefix (`chrt --idle 0 nice -n19 ionice --class idle`) for sub
 PDF/Images → convert & clean (parallel, low-prio) → cache → PuzzlePiece list
   → Auto-Detect (ORB matching, BFS placement) → scene positions
   → Manual adjust / Snap / Cut → Export TIFF
+                              ↘ Add Legend (region off any page, excluded from
+                                matching) → placed by hand → uprighted on export
 ```
 
 ## Running

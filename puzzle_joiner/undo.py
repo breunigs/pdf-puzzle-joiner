@@ -156,6 +156,36 @@ class DeleteCommand(QUndoCommand):
             self.post_fn()
 
 
+class AddPieceCommand(QUndoCommand):
+    """Undoable piece addition — used for adding and duplicating legends."""
+
+    def __init__(self, piece, pieces_list, scene, thumbnail_panel,
+                 post_fn=None, description="Add Legend"):
+        super().__init__(description)
+        self.piece = piece
+        self.pieces_list = pieces_list
+        self.scene = scene
+        self.thumbnail_panel = thumbnail_panel
+        self.post_fn = post_fn
+
+    def redo(self):
+        self.pieces_list.append(self.piece)
+        self.scene.add_piece(self.piece)
+        item = self.scene.piece_items.get(self.piece)
+        if item:
+            item.sync_from_piece()
+        self.thumbnail_panel.add_piece(self.piece)
+        if self.post_fn:
+            self.post_fn()
+
+    def undo(self):
+        self.pieces_list.remove(self.piece)
+        self.scene.remove_piece(self.piece)
+        self.thumbnail_panel.remove_piece(self.piece)
+        if self.post_fn:
+            self.post_fn()
+
+
 class CropCommand(QUndoCommand):
     """Undoable crop/lasso change on a single piece.
 
