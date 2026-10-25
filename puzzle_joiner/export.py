@@ -1,4 +1,5 @@
 import contextlib
+import json
 import math
 import os
 
@@ -25,6 +26,9 @@ _ENCODE_WORKERS = max(1, (os.cpu_count() or 2) * 3 // 4)
 # typed, so the real ceiling is SHRT_MAX; this leaves room for the margins).
 _WARP_DST_CHUNK = 8192
 _WARP_SRC_LIMIT = 24000
+# Width of the mask the map's outline is traced on. Fine enough to follow the
+# edge of a plan, coarse enough to trace in a moment.
+_FOOTPRINT_WIDTH = 4000
 
 
 def _layer_name(piece: PuzzlePiece) -> str:
@@ -577,7 +581,89 @@ def export_geotiff(pieces: list, output_path: str, gcps: list,
     return True
 
 
-def write_qgis_project(project_path: str, raster_path: str) -> bool:
+def _mercator_to_lonlat(x: float, y: float):
+    """EPSG:3857 metres to WGS84 degrees."""
+    radius = georef.WORLD_EXTENT / math.pi
+    return (math.degrees(x / radius),
+            math.degrees(2.0 * math.atan(math.exp(y / radius)) - math.pi / 2.0))
+
+
+def map_footprint(pieces: list, gcps: list, method: str = georef.DEFAULT_METHOD):
+    """The ground the map covers, as WGS84 rings. None when it cannot be fitted.
+
+    Traced from the map pieces alone, so a legend — which sits beside the map,
+    over ground it has nothing to do with — is never part of it.
+
+    Worth doing here rather than reading it back off the finished raster,
+    because the raster cannot answer it. Nothing in those pixels says which
+    blob is a legend: on one real plan the footprint came out as seven parts,
+    six of them legends, with the map fourth in the list. Telling them apart by
+    size works until a small map meets a large legend. The export knows which
+    pieces are legends, so it is the one that should say.
+    """
+    transform = georef_transform(gcps, method)
+    if transform is None:
+        return None
+    G, scale = transform
+    pieces = export_order(pieces)
+    affines = _export_affines(pieces, global_transform=G)
+    origin_x, origin_y, canvas_w, canvas_h = export_canvas(pieces, affines)
+
+    shrink = min(1.0, _FOOTPRINT_WIDTH / max(1, canvas_w))
+    mask = np.zeros((max(1, round(canvas_h * shrink)),
+                     max(1, round(canvas_w * shrink))), dtype=np.uint8)
+    drawn = False
+    for piece, M in zip(pieces, affines):
+        if piece.is_legend:
+            continue
+        points = piece.get_outline_points().reshape(-1, 1, 2).astype(np.float64)
+        grid = cv2.transform(points, M).reshape(-1, 2) - (origin_x, origin_y)
+        cv2.fillPoly(mask, [np.round(grid * shrink).astype(np.int32)], 255)
+        drawn = True
+    if not drawn:
+        return None
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    rings = []
+    for contour in contours:
+        # About 6 m on the ground: close enough to follow the edge of a
+        # plan, loose enough to keep the ring down to a sane node count,
+        # since map.osm spends one node per point.
+        outline = cv2.approxPolyDP(contour, 4.0, True).reshape(-1, 2)
+        if len(outline) < 3:
+            continue
+        ring = [_mercator_to_lonlat((x / shrink + origin_x) * scale,
+                                    -(y / shrink + origin_y) * scale)
+                for x, y in outline]
+        ring.append(ring[0])
+        rings.append(ring)
+    return rings or None
+
+
+def write_map_footprint(path: str, pieces: list, gcps: list,
+                        method: str = georef.DEFAULT_METHOD) -> bool:
+    """Write the map's footprint beside the raster. False if it cannot be fitted."""
+    rings = map_footprint(pieces, gcps, method)
+    if not rings:
+        return False
+    with open(path, "w") as handle:
+        json.dump({
+            "type": "FeatureCollection",
+            "features": [{
+                "type": "Feature",
+                "properties": {"source": "puzzle-joiner", "legends": "excluded"},
+                "geometry": {
+                    "type": "MultiPolygon",
+                    "coordinates": [[[list(point) for point in ring]]
+                                    for ring in rings],
+                },
+            }],
+        }, handle)
+    return True
+
+
+def write_qgis_project(project_path: str, raster_path: str,
+                       footprint_path: str = None) -> bool:
     """Write a QGIS project listing `raster_path`, over an OSM basemap.
 
     Written by QGIS itself rather than assembled as XML here, so it is a real
@@ -589,6 +675,11 @@ def write_qgis_project(project_path: str, raster_path: str) -> bool:
     project's own directory. Hence relative path storage, and hence writing the
     project beside the raster. The basemap is a tile layer, so that filter
     drops it and only the warped raster is handed on.
+
+    `footprint_path` rides along as a vector layer. The same `.tif` filter
+    passes over it, so it costs that task nothing, and it means the ground the
+    map covers travels with the project instead of having to be guessed at
+    from the pixels — see `map_footprint`.
     """
     core, _ = georef._qgis()
     project = core.QgsProject()
@@ -601,8 +692,11 @@ def write_qgis_project(project_path: str, raster_path: str) -> bool:
         raster_path, os.path.splitext(os.path.basename(raster_path))[0], "gdal")
     if not raster.isValid():
         return False
+    layers = [basemap, raster]
+    if footprint_path and os.path.exists(footprint_path):
+        layers.append(core.QgsVectorLayer(footprint_path, "map outline", "ogr"))
     # Basemap first so it lands underneath; the map is what sits on top.
-    project.addMapLayers([layer for layer in (basemap, raster) if layer.isValid()])
+    project.addMapLayers([layer for layer in layers if layer.isValid()])
     return project.write(project_path)
 
 

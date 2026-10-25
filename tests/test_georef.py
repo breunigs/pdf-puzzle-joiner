@@ -434,6 +434,95 @@ class TestGeoreferencedPlacement(unittest.TestCase):
 
 
 @needs_qgis
+class TestMapFootprint(unittest.TestCase):
+    """The ground the map covers, stated by the export instead of guessed.
+
+    Read back off the finished raster it cannot be known: nothing in the pixels
+    says which blob is a legend. On a real plan gdal returned seven parts, six
+    of them legends, the map fourth in the list. Only the export knows.
+    """
+
+    SCALE = 0.25
+    ORIGIN = (1122000.0, 7089000.0)
+
+    def truth(self, canvas_x, canvas_y):
+        return (self.ORIGIN[0] + self.SCALE * canvas_x,
+                self.ORIGIN[1] - self.SCALE * canvas_y)
+
+    def assembly(self, with_legend=False, gap=0.0):
+        """Two pages side by side, touching unless `gap` separates them."""
+        import cv2
+        pieces = []
+        for index, x in enumerate((0.0, 380.0 + gap)):
+            piece = make_piece(400, 300, name=f"page_{index:04d}.png")
+            piece.x = x
+            M = piece.get_affine_matrix()
+            for img_x, img_y in ((20.0, 30.0), (360.0, 40.0), (50.0, 260.0)):
+                canvas = cv2.transform(
+                    np.array([[[img_x, img_y]]], np.float64), M).reshape(2)
+                piece.gcps.append((img_x, img_y) + self.truth(*canvas))
+            pieces.append(piece)
+        if with_legend:
+            legend = make_piece(120, 90, name="page_0000.png")
+            legend.is_legend = True
+            legend.legend_instance = 1
+            legend.x, legend.y = -900.0, -700.0
+            pieces.append(legend)
+        return pieces
+
+    def footprint(self, pieces):
+        from puzzle_joiner.export import map_footprint
+        return map_footprint(pieces, canvas_gcps(pieces), "Helmert")
+
+    def test_pages_that_touch_give_one_ring(self):
+        rings = self.footprint(self.assembly())
+        self.assertEqual(len(rings), 1)
+
+    def test_a_legend_changes_nothing(self):
+        """The whole point: a legend covers ground that is not the map's."""
+        self.assertEqual(self.footprint(self.assembly()),
+                         self.footprint(self.assembly(with_legend=True)))
+
+    def test_pages_apart_give_a_ring_each(self):
+        """Not merged behind the caller's back — the gap is real."""
+        self.assertEqual(len(self.footprint(self.assembly(gap=600.0))), 2)
+
+    def test_the_ring_lands_on_the_mapped_ground(self):
+        ring = self.footprint(self.assembly())[0]
+        lons = [point[0] for point in ring]
+        lats = [point[1] for point in ring]
+        # The assembly maps onto a patch just east of Hamburg's centre.
+        self.assertTrue(10.0 < min(lons) < 10.1, min(lons))
+        self.assertTrue(53.5 < min(lats) < 53.6, min(lats))
+
+    def test_no_fit_means_no_footprint(self):
+        from puzzle_joiner.export import map_footprint
+        self.assertIsNone(map_footprint(self.assembly(), [], "Helmert"))
+
+    def test_the_written_file_is_a_geojson_multipolygon(self):
+        from puzzle_joiner.export import write_map_footprint
+        pieces = self.assembly(with_legend=True)
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "out.geojson")
+            self.assertTrue(
+                write_map_footprint(path, pieces, canvas_gcps(pieces), "Helmert"))
+            with open(path) as handle:
+                data = json.load(handle)
+        geometry = data["features"][0]["geometry"]
+        self.assertEqual(geometry["type"], "MultiPolygon")
+        self.assertEqual(len(geometry["coordinates"]), 1)
+        ring = geometry["coordinates"][0][0]
+        self.assertEqual(ring[0], ring[-1], "ring must close")
+
+    def test_nothing_is_written_when_there_is_no_fit(self):
+        from puzzle_joiner.export import write_map_footprint
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "out.geojson")
+            self.assertFalse(write_map_footprint(path, self.assembly(), []))
+            self.assertFalse(os.path.exists(path))
+
+
+@needs_qgis
 class TestQgisProject(unittest.TestCase):
     """The project file veloroute's `mix velo.map.image.from_qgis` consumes."""
 

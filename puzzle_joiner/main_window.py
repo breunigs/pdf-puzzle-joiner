@@ -29,7 +29,7 @@ from .cache import (
 from .matching import auto_detect_placements, snap_piece_to_neighbors
 from .export import (
     export_layered_tiff, export_flattened_tiff, canvas_gcps, export_geotiff,
-    georef_transform, write_qgis_project,
+    georef_transform, write_map_footprint, write_qgis_project,
 )
 from .legend import make_legend_piece, clone_legend_piece
 from . import georef
@@ -904,6 +904,7 @@ class MainWindow(QMainWindow):
         # Beside the raster, because the import task resolves the
         # layer source against the project's own directory.
         project_path = f"{base}_warped.qgs"
+        footprint_path = f"{base}_warped.geojson"
 
         def task(progress):
             written = []
@@ -927,8 +928,14 @@ class MainWindow(QMainWindow):
                 progress.emit(70, "Exporting georeferenced TIFF...")
                 if export_geotiff(self.pieces, warped_path, gcps, method):
                     written.append(warped_path)
-                    progress.emit(92, "Writing QGIS project...")
-                    if write_qgis_project(project_path, warped_path):
+                    progress.emit(90, "Writing map footprint...")
+                    # Legends sit beside the map; only the export knows which
+                    # pieces they are, so it states the footprint rather than
+                    # leaving it to be read back off the pixels.
+                    if write_map_footprint(footprint_path, self.pieces, gcps, method):
+                        written.append(footprint_path)
+                    progress.emit(93, "Writing QGIS project...")
+                    if write_qgis_project(project_path, warped_path, footprint_path):
                         written.append(project_path)
             progress.emit(95, "Done.")
             return tuple(written)
