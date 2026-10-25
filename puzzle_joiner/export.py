@@ -9,7 +9,7 @@ import tifffile
 
 from . import georef
 from .model import PuzzlePiece
-from .legend import anchor_local, map_hull, separate_legends, upright_affine
+from .legend import anchor_local, map_outlines, separate_legends, upright_affine
 
 TILE = 1024
 # Byte budget for one horizontal band of the canvas. Bands are rendered and
@@ -106,14 +106,14 @@ def _export_affines(pieces, global_transform=None):
     if R3 is None and not legends:
         return base
 
-    hull = map_hull(map_pieces) if legends else None
+    hulls = map_outlines(map_pieces) if legends else []
     result = []
     anchors = {}
     for idx, (piece, M) in enumerate(zip(pieces, base)):
         if R3 is not None:
             M = (R3 @ np.vstack([M, [0, 0, 1]]))[:2]
         if piece.is_legend:
-            anchors[idx] = anchor_local(piece, hull)
+            anchors[idx] = anchor_local(piece, hulls)
             M = upright_affine(M, anchors[idx])
         result.append(M)
     if legends:

@@ -107,13 +107,104 @@ def transformed_hull(pairs) -> np.ndarray:
     return cv2.convexHull(all_pts).reshape(-1, 2)
 
 
-def map_hull(pieces) -> np.ndarray:
-    """Convex hull of every non-legend piece's opaque extent, in world coords.
+def transformed_outline(piece: PuzzlePiece, M: np.ndarray) -> np.ndarray:
+    """A piece's opaque outline in world coords, concavities and all."""
+    pts = piece.get_outline_points().reshape(-1, 1, 2)
+    return cv2.transform(pts, M.astype(np.float32)).reshape(-1, 2)
 
-    Returns None when there is no map to measure a legend against.
+
+def map_outlines(pieces) -> list:
+    """Each non-legend piece's outline in world coords. [] without a map.
+
+    Outlines, and not hulls. One hull over the whole map fills in every bend of
+    the road it follows; a hull per page still came out two to three times the
+    area the page covers. Legends pushed clear of a shape that size finished up
+    to 120 m from the map they belong to, having been moved as much as 250 m to
+    get there. A legend only has to clear the map, so the map is what it is
+    measured against.
     """
-    return transformed_hull([(p, p.get_affine_matrix())
-                             for p in pieces if not p.is_legend])
+    return [transformed_outline(p, p.get_affine_matrix())
+            for p in pieces
+            if not p.is_legend and len(p.get_outline_points()) >= 3]
+
+
+def convex_parts(polygon: np.ndarray) -> list:
+    """A simple polygon split into triangles, by ear clipping.
+
+    `_ray_overlap_interval` clips a ray against a Minkowski difference and
+    needs both shapes convex. A triangle always is, and together they cover the
+    outline exactly, so nothing is fattened to buy that convexity.
+    """
+    pts = [(float(x), float(y)) for x, y in polygon]
+    if len(pts) > 1 and pts[0] == pts[-1]:
+        pts.pop()
+    if len(pts) < 3:
+        return []
+    if _signed_area(pts) < 0.0:
+        pts.reverse()
+
+    remaining = list(range(len(pts)))
+    triangles = []
+    # Each pass clips at least one ear off a simple polygon, so the count is a
+    # termination guard rather than a tuning knob.
+    for _ in range(len(pts)):
+        if len(remaining) <= 3:
+            break
+        for k in range(len(remaining)):
+            prev, ear, nxt = (remaining[k - 1], remaining[k],
+                              remaining[(k + 1) % len(remaining)])
+            a, b, c = pts[prev], pts[ear], pts[nxt]
+            if _cross2(a, b, c) <= 0.0:
+                continue  # reflex corner, not an ear
+            if any(_in_triangle(pts[j], a, b, c)
+                   for j in remaining if j not in (prev, ear, nxt)):
+                continue  # another vertex is inside, so it is not an ear
+            triangles.append(np.array([a, b, c], dtype=np.float32))
+            remaining.pop(k)
+            break
+        else:
+            break  # nothing clippable left; keep what the fan gave us
+    if len(remaining) >= 3:
+        triangles.append(np.array([pts[i] for i in remaining[:3]], dtype=np.float32))
+        for k in range(3, len(remaining)):
+            triangles.append(np.array(
+                [pts[remaining[0]], pts[remaining[k - 1]], pts[remaining[k]]],
+                dtype=np.float32))
+    return triangles
+
+
+def _signed_area(pts) -> float:
+    return sum((pts[i][0] * pts[(i + 1) % len(pts)][1]
+                - pts[(i + 1) % len(pts)][0] * pts[i][1])
+               for i in range(len(pts))) / 2.0
+
+
+def _cross2(a, b, c) -> float:
+    return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+
+
+def _in_triangle(p, a, b, c) -> bool:
+    d1, d2, d3 = _cross2(a, b, p), _cross2(b, c, p), _cross2(c, a, p)
+    return (d1 >= 0 and d2 >= 0 and d3 >= 0) or (d1 <= 0 and d2 <= 0 and d3 <= 0)
+
+
+def _usable_hulls(hulls) -> list:
+    """Drop the shapes with too few points to enclose anything."""
+    return [h for h in hulls if h is not None and len(h) >= 3]
+
+
+def _contours(hulls):
+    return [h.reshape(-1, 1, 2).astype(np.float32) for h in hulls]
+
+
+def _depth_in_map(point, contours) -> float:
+    """Signed distance into the map: positive inside any piece, else negative.
+
+    Taking the maximum is what makes a list of pieces behave as one map — a
+    point inside any of them is inside, and outside them all the largest value
+    is the one nearest a boundary.
+    """
+    return max(cv2.pointPolygonTest(c, point, True) for c in contours)
 
 
 def _densify(pts: np.ndarray, per_edge: int = _ANCHOR_SAMPLES) -> np.ndarray:
@@ -126,7 +217,7 @@ def _densify(pts: np.ndarray, per_edge: int = _ANCHOR_SAMPLES) -> np.ndarray:
     return np.vstack(edges).astype(np.float32)
 
 
-def anchor_local(legend: PuzzlePiece, hull: np.ndarray) -> np.ndarray:
+def anchor_local(legend: PuzzlePiece, hulls) -> np.ndarray:
     """The legend-local point to pivot on: the one nearest the assembled map.
 
     Falls back to the centre of the legend's outline when there is no map.
@@ -134,15 +225,16 @@ def anchor_local(legend: PuzzlePiece, hull: np.ndarray) -> np.ndarray:
     rigid, so the winning point is the same one in export space.
     """
     local = legend.get_outline_points()
-    if hull is None or len(hull) < 3:
+    hulls = _usable_hulls(hulls or [])
+    if not hulls:
         return local.mean(axis=0)
     dense = _densify(local)
     M = legend.get_affine_matrix().astype(np.float32)
     world = cv2.transform(dense.reshape(-1, 1, 2), M).reshape(-1, 2)
-    contour = hull.reshape(-1, 1, 2).astype(np.float32)
-    # pointPolygonTest is positive inside the hull, so negating orders the
-    # candidates as: deepest inside, then nearest outside.
-    dists = [-cv2.pointPolygonTest(contour, (float(px), float(py)), True)
+    contours = _contours(hulls)
+    # Depth is positive inside the map, so negating orders the candidates as:
+    # deepest inside, then nearest outside.
+    dists = [-_depth_in_map((float(px), float(py)), contours)
              for px, py in world]
     return dense[int(np.argmin(dists))]
 
@@ -171,37 +263,50 @@ def nearest_hull_point(point: np.ndarray, hull: np.ndarray) -> np.ndarray:
     return best
 
 
+def nearest_map_point(point: np.ndarray, hulls) -> np.ndarray:
+    """Closest point to `point` on the boundary of any of the map's pieces."""
+    best = None
+    best_d = float("inf")
+    for hull in hulls:
+        candidate = nearest_hull_point(point, hull)
+        d = float(np.sum((candidate - point) ** 2))
+        if d < best_d:
+            best_d = d
+            best = candidate
+    return best
+
+
 def anchor_pair(legend: PuzzlePiece, pieces) -> tuple:
     """World-space (legend anchor, nearest map point) for a legend, or None.
 
     Used by the canvas to show which point the export will pivot on.
     """
-    hull = map_hull(pieces)
-    if hull is None or len(hull) < 3:
+    hulls = map_outlines(pieces)
+    if not hulls:
         return None
-    local = anchor_local(legend, hull)
+    local = anchor_local(legend, hulls)
     M = legend.get_affine_matrix().astype(np.float32)
     world = cv2.transform(local.reshape(1, 1, 2).astype(np.float32), M).reshape(2)
-    return world, nearest_hull_point(world, hull)
+    return world, nearest_map_point(world, hulls)
 
 
-def _outward_direction(anchor_world, hull, legend_pts) -> tuple:
+def _outward_direction(anchor_world, hulls, legend_pts) -> tuple:
     """(unit vector away from the map, whether the legend starts on top of it).
 
     Normally that is the direction from the map's nearest point out to the
     anchor. When the anchor is *inside* the map the legend already overlaps it,
     and the shortest way clear is towards the nearest edge — the opposite sign.
     """
-    if hull is not None and len(hull) >= 3:
+    hulls = _usable_hulls(hulls or [])
+    if hulls:
         point = (float(anchor_world[0]), float(anchor_world[1]))
-        inside = cv2.pointPolygonTest(
-            hull.reshape(-1, 1, 2).astype(np.float32), point, False) >= 0
-        near = nearest_hull_point(anchor_world.astype(np.float32), hull)
+        inside = _depth_in_map(point, _contours(hulls)) >= 0
+        near = nearest_map_point(anchor_world.astype(np.float32), hulls)
         away = (near - anchor_world) if inside else (anchor_world - near)
         length = float(np.linalg.norm(away))
         if length > 1e-6:
             return away / length, inside
-        away = legend_pts.mean(axis=0) - hull.mean(axis=0)
+        away = legend_pts.mean(axis=0) - np.vstack(hulls).mean(axis=0)
         length = float(np.linalg.norm(away))
         if length > 1e-6:
             return away / length, inside
@@ -303,24 +408,27 @@ def separate_legends(pieces, affines, anchors) -> list:
     if not indices:
         return affines
     result = list(affines)
-    hull = transformed_hull([(p, M) for p, M in zip(pieces, affines)
-                             if not p.is_legend])
+    outlines = _usable_hulls(transformed_outline(p, M)
+                             for p, M in zip(pieces, affines) if not p.is_legend)
+    # Outlines answer "how far from the map"; their triangles are what the ray
+    # clipping can actually work against.
+    hulls = outlines
     shapes = {i: transformed_hull([(pieces[i], affines[i])]).astype(np.float64)
               for i in indices}
 
     def rank(i):
         pts = shapes[i]
-        if hull is None:
+        if not hulls:
             return (0.0, pieces[i].legend_instance)
-        gap = min(float(np.linalg.norm(p - nearest_hull_point(p, hull)))
+        gap = min(float(np.linalg.norm(p - nearest_map_point(p, hulls)))
                   for p in pts.astype(np.float32))
         return (gap, pieces[i].legend_instance)
 
-    obstacles = [hull.astype(np.float64)] if hull is not None else []
+    obstacles = [t.astype(np.float64) for o in outlines for t in convex_parts(o)]
     for i in sorted(indices, key=rank):
         moving = shapes[i]
         anchor_world = result[i] @ np.array([anchors[i][0], anchors[i][1], 1.0])
-        outward, on_the_map = _outward_direction(anchor_world, hull, moving)
+        outward, on_the_map = _outward_direction(anchor_world, hulls, moving)
         shift = _separation_shift(moving, obstacles, outward,
                                   allow_reverse=on_the_map)
         if np.any(shift):

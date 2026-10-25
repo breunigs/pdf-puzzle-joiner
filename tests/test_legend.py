@@ -15,7 +15,8 @@ from puzzle_joiner.model import PuzzlePiece
 from puzzle_joiner.widgets import PuzzleScene
 from puzzle_joiner.legend import (
     SEPARATION_MARGIN, _ray_overlap_interval, anchor_local, anchor_pair,
-    clone_legend_piece, make_legend_piece, map_hull, nearest_hull_point,
+    clone_legend_piece, convex_parts, make_legend_piece, map_outlines,
+    nearest_map_point,
     upright_affine,
 )
 from puzzle_joiner.export import (
@@ -129,19 +130,72 @@ class TestLayoutKey:
         assert page.layout_key() not in keys
 
 
-class TestMapHull:
+class TestConvexParts:
+    """A concave outline split into triangles, so ray clipping can use it."""
+
+    L_SHAPE = np.array([[0, 0], [10, 0], [10, 2], [2, 2], [2, 10], [0, 10]],
+                       dtype=np.float32)
+
+    def _area(self, parts):
+        return sum(abs(cv2.contourArea(p)) for p in parts)
+
+    def test_a_square_is_covered_exactly(self):
+        square = np.array([[0, 0], [10, 0], [10, 10], [0, 10]], dtype=np.float32)
+        assert self._area(convex_parts(square)) == pytest.approx(100.0)
+
+    def test_a_concave_outline_is_covered_without_fattening(self):
+        """The whole point: a hull would swallow the notch, triangles do not."""
+        area = abs(cv2.contourArea(self.L_SHAPE))
+        assert self._area(convex_parts(self.L_SHAPE)) == pytest.approx(area)
+        assert abs(cv2.contourArea(cv2.convexHull(self.L_SHAPE))) > area * 1.3
+
+    def test_every_part_is_a_triangle(self):
+        assert all(len(p) == 3 for p in convex_parts(self.L_SHAPE))
+
+    def test_nothing_lands_outside_the_outline(self):
+        outline = self.L_SHAPE.reshape(-1, 1, 2)
+        for part in convex_parts(self.L_SHAPE):
+            centre = part.mean(axis=0)
+            assert cv2.pointPolygonTest(
+                outline, (float(centre[0]), float(centre[1])), False) >= 0
+
+    def test_a_closed_ring_is_handled(self):
+        """A repeated first point must not become a degenerate triangle."""
+        closed = np.vstack([self.L_SHAPE, self.L_SHAPE[:1]])
+        assert self._area(convex_parts(closed)) == pytest.approx(
+            abs(cv2.contourArea(self.L_SHAPE)))
+
+    def test_too_few_points_give_nothing(self):
+        assert convex_parts(np.array([[0, 0], [1, 1]], dtype=np.float32)) == []
+
+
+class TestMapOutlines:
     def test_legends_are_left_out(self):
         page = _page()
         m = _map_piece()
         legend = make_legend_piece(page, (300, 20, 80, 60))
         legend.x, legend.y = 5000, 5000
-        hull = map_hull([m, legend])
-        assert hull[:, 0].max() <= 200
-        assert hull[:, 1].max() <= 200
+        hulls = map_outlines([m, legend])
+        assert len(hulls) == 1
+        assert hulls[0][:, 0].max() <= 200
+        assert hulls[0][:, 1].max() <= 200
 
-    def test_none_without_a_map(self):
+    def test_one_shape_per_map_piece(self):
+        """Not one hull over the lot: that fills in every bend of the map."""
+        assert len(map_outlines([_map_piece(), _map_piece()])) == 2
+
+    def test_a_lasso_keeps_its_concavity(self):
+        """A hull here measured two to three times the ground a page covers."""
+        piece = _map_piece()
+        piece.apply_crop((0, 0, 200, 200),
+                         [(0, 0), (200, 0), (200, 80), (80, 80), (80, 200), (0, 200)])
+        outline = map_outlines([piece])[0]
+        assert abs(cv2.contourArea(outline.astype(np.float32))) < abs(
+            cv2.contourArea(cv2.convexHull(outline.astype(np.float32))))
+
+    def test_empty_without_a_map(self):
         page = _page()
-        assert map_hull([make_legend_piece(page, (300, 20, 80, 60))]) is None
+        assert map_outlines([make_legend_piece(page, (300, 20, 80, 60))]) == []
 
 
 class TestAnchor:
@@ -155,12 +209,12 @@ class TestAnchor:
     def test_legend_to_the_right_anchors_on_its_left_edge(self):
         m = _map_piece()  # covers world (0,0)-(200,200)
         legend = self._legend_at(400, 100)
-        assert anchor_local(legend, map_hull([m]))[0] == pytest.approx(0.0)
+        assert anchor_local(legend, map_outlines([m]))[0] == pytest.approx(0.0)
 
     def test_legend_below_anchors_on_its_top_edge(self):
         m = _map_piece()
         legend = self._legend_at(100, 500)
-        assert anchor_local(legend, map_hull([m]))[1] == pytest.approx(0.0)
+        assert anchor_local(legend, map_outlines([m]))[1] == pytest.approx(0.0)
 
     def test_falls_back_to_the_centre_without_a_map(self):
         legend = self._legend_at(400, 100)
@@ -172,17 +226,17 @@ class TestAnchor:
         """Sampling edges, not just corners: a side-on legend anchors mid-edge."""
         m = _map_piece()
         legend = self._legend_at(400, 100)
-        hull = map_hull([m])
+        hull = map_outlines([m])
         anchor = anchor_local(legend, hull)
         local = legend.get_outline_points()
         world = np.array([anchor[0] + 400 - 40, anchor[1] + 100 - 30])
-        best = nearest_hull_point(world.astype(np.float32), hull)
+        best = nearest_map_point(world.astype(np.float32), hull)
         chosen = float(np.linalg.norm(world - best))
         # No outline vertex can be closer than the point the search picked.
         for px, py in local:
             vertex = np.array([px + 400 - 40, py + 100 - 30], dtype=np.float32)
             assert chosen <= float(np.linalg.norm(
-                vertex - nearest_hull_point(vertex, hull))) + 1e-3
+                vertex - nearest_map_point(vertex, hull))) + 1e-3
 
     def test_anchor_pair_spans_legend_to_map(self):
         m = _map_piece()
@@ -256,7 +310,7 @@ class TestExportAffines:
         map_pieces = self._rotated_map()
         legend = self._legend(rot=35.0)
         pieces = map_pieces + [legend]
-        anchor = anchor_local(legend, map_hull(map_pieces))
+        anchor = anchor_local(legend, map_outlines(map_pieces))
         pt = np.array([anchor[0], anchor[1], 1.0])
 
         # What the legend's matrix would be if it just rode the global rotation.
@@ -283,10 +337,10 @@ class TestExportAffines:
             hull.append(o @ M[:, :2].T + M[:, 2])
         hull = cv2.convexHull(np.vstack(hull).astype(np.float32)).reshape(-1, 2)
 
-        anchor = anchor_local(legend, map_hull(pieces[:-1]))
+        anchor = anchor_local(legend, map_outlines(pieces[:-1]))
         world = affines[-1] @ np.array([anchor[0], anchor[1], 1.0])
         export_gap = float(np.linalg.norm(
-            world - nearest_hull_point(world.astype(np.float32), hull)))
+            world - nearest_map_point(world.astype(np.float32), [hull])))
         assert export_gap == pytest.approx(canvas_gap, abs=0.5)
 
     def test_legends_do_not_sway_the_optimal_rotation(self):
@@ -416,6 +470,11 @@ def _overlap_area(a, b):
     return area
 
 
+def _overlap_map(shape, hulls):
+    """Worst overlap between a shape and any piece of the map."""
+    return max((_overlap_area(shape, h) for h in hulls), default=0.0)
+
+
 class TestSeparation:
     """Squaring a legend up changes its footprint, so it can hit a neighbour."""
 
@@ -436,7 +495,7 @@ class TestSeparation:
     def _push(self, pieces):
         """Per-instance distance each legend was moved by the separation pass."""
         affines = _export_affines(pieces)
-        hull = map_hull([p for p in pieces if not p.is_legend])
+        hull = map_outlines([p for p in pieces if not p.is_legend])
         pushed = {}
         for piece, M in zip(pieces, affines):
             if not piece.is_legend:
@@ -490,9 +549,9 @@ class TestSeparation:
     def test_a_legend_on_the_map_is_pushed_off_it(self):
         pieces = self._map() + [self._legend(300, 80, 20, 1)]
         affines = _export_affines(pieces)
-        hull = map_hull(pieces[:2])
+        hulls = map_outlines(pieces[:2])
         legend = _outline_world(pieces[-1], affines[-1])
-        assert _overlap_area(legend, hull) == 0
+        assert _overlap_map(legend, hulls) == 0
 
     def test_a_legend_on_the_map_leaves_by_the_nearest_edge(self):
         """Clearing a 100-tall map from the middle is ~51 px, not ~111."""
@@ -504,9 +563,9 @@ class TestSeparation:
                                 self._legend(360, 255, 30, 2),
                                 self._legend(330, 285, 15, 3)]
         shapes = self._shapes(pieces)
-        hull = map_hull(pieces[:2])
+        hulls = map_outlines(pieces[:2])
         for a in (1, 2, 3):
-            assert _overlap_area(shapes[a], hull) == 0
+            assert _overlap_map(shapes[a], hulls) == 0
             for b in (1, 2, 3):
                 if a < b:
                     assert _overlap_area(shapes[a], shapes[b]) == 0, f"{a} vs {b}"
